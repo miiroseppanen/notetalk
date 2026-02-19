@@ -32,6 +32,14 @@ local function pitch_to_x(pitch_midi, cols, pitch_min_midi, pitch_max_midi)
   return clamp(x, 1, cols)
 end
 
+-- VU-tyylinen mappaus: pienet tasot nostavat palkkia enemmän (log-tyyppinen), isommat eivät ylikäy
+-- level 0–1 → display 0–1, power < 1 vahvistaa matalia
+local function vu_curve(level, power)
+  if level <= 0 then return 0 end
+  power = power or 0.55
+  return math.pow(clamp(level, 0, 1), power)
+end
+
 local function amp_to_lit_rows(amp_norm, vu_floor, rows)
   if rows < 1 then
     return 0
@@ -101,13 +109,7 @@ function GridVisualizer:draw()
 
   local ok, err = pcall(function()
     g:all(0)
-
-    local vu_floor = 0.02
-    local vu_mode = "wide"
-    pcall(function()
-      vu_floor = params:get("vu_floor") or vu_floor
-      vu_mode = params:string("vu_mode") or vu_mode
-    end)
+    local vu_floor = params:get("vu_floor") or 0.02
 
     if state.vu_test_mode then
       local t = util.time()
@@ -129,16 +131,19 @@ function GridVisualizer:draw()
       end
     else
       local sample_mode = source_is_sample()
-      local vu_amp
+      local vu_raw
       if sample_mode then
-        local a = state.amp_norm or 0
+        -- Käytä amp_for_vu (pelkkä volume), ei amp_norm (sis. trigger-pulssin) → ei nousua hiljaisella
+        local a = state.amp_for_vu or state.amp_norm or 0
         local v = state.vu_level or 0
-        vu_amp = math.max(a, v)
-        vu_amp = math.min(1, vu_amp * 2.0)
-        vu_floor = 0.01
+        vu_raw = math.max(a, v)
+        vu_raw = math.min(1, vu_raw * 1.8)  -- maltillinen vahvistus, ei koko ajan maksimissa
+        vu_floor = 0.02
       else
-        vu_amp = clamp(state.vu_level or 0, 0, 1)
+        vu_raw = clamp(state.vu_level or 0, 0, 1)
       end
+      -- VU-käyrä: lievä nosto matalille, max vain oikeasti koville piikeille (power > 0.5)
+      local vu_amp = vu_curve(vu_raw, 0.68)
 
       local pitch_min = params:get("pitch_min_midi") or 36
       local pitch_max = params:get("pitch_max_midi") or 96
@@ -147,58 +152,67 @@ function GridVisualizer:draw()
       if pitch_midi_grid and pitch_midi_grid >= pitch_min and pitch_midi_grid <= pitch_max then
         pitch_x = pitch_to_x(pitch_midi_grid, cols, pitch_min, pitch_max)
       end
-      local decay = sample_mode and 0.76 or 0.91
-      local rise_speed = sample_mode and 0.92 or 0.28  -- nopea nousu = vähän viivettä
+      local decay = sample_mode and 0.46 or 0.91   -- hyvin nopea putoaminen = maksimaalinen responsiivisuus
+      local rise_speed = sample_mode and 1.0 or 0.28  -- nousu täysin välitön
       local spread_radius = math.max(2, math.floor(cols * 0.35))
+      local spread_inv = 1 / (spread_radius + 1)
       for x = 1, cols do
         state.grid_col_amp[x] = (state.grid_col_amp[x] or 0) * decay
       end
       if vu_amp > 0 then
-        local full_width_base = sample_mode and (vu_amp * 0.5) or 0
-        for x = 1, cols do
-          local target = full_width_base
-          if pitch_x then
-            local dist = math.abs(x - pitch_x)
-            local peak = (dist <= spread_radius) and (vu_amp * (1 - (dist / (spread_radius + 1)) * 0.65)) or 0
-            target = target + peak
-          elseif not sample_mode then
-            target = vu_amp
-          end
-          target = clamp(target, 0, 1)
-          state.grid_col_amp[x] = math.max(target, state.grid_col_amp[x] or 0)
-        end
-        if sample_mode and not pitch_x then
+        if sample_mode then
+          -- Sarakkeiden ero: pitch-piikki (keskitysbias ettei vain vasemmalle) + matala pohja
+          local center_col = (cols * 0.5) + 0.5
+          local peak_center = pitch_x and round(0.35 * pitch_x + 0.65 * center_col) or round(center_col)
+          peak_center = clamp(peak_center, 1, cols)
+          local base = vu_amp * 0.25  -- pohja kaikille, ei yhtenäinen maksimi
           for x = 1, cols do
-            state.grid_col_amp[x] = math.max(vu_amp, state.grid_col_amp[x] or 0)
+            local dist = math.abs(x - peak_center)
+            local peak = (dist <= spread_radius) and (vu_amp * (1 - (dist * spread_inv) * 0.7)) or 0
+            local target = clamp(base + peak, 0, 1)
+            state.grid_col_amp[x] = math.max(target, state.grid_col_amp[x] or 0)
+          end
+        else
+          -- Line-in: pitch-piikki tai koko leveys
+          for x = 1, cols do
+            local target = 0
+            if pitch_x then
+              local dist = math.abs(x - pitch_x)
+              local peak = (dist <= spread_radius) and (vu_amp * (1 - (dist * spread_inv) * 0.65)) or 0
+              target = target + peak
+            else
+              target = vu_amp
+            end
+            target = clamp(target, 0, 1)
+            state.grid_col_amp[x] = math.max(target, state.grid_col_amp[x] or 0)
           end
         end
       end
-      -- Näyttötaso: lähes välitön nousu (max tasoitettu, hetkellinen) → lyhyempi viive
+      -- Nousu = välitön (target), lasku = tasoitettu → minimaalinen reaktioaika
       for x = 1, cols do
         local target = state.grid_col_amp[x] or 0
         local cur = state.grid_col_display[x] or 0
-        local smoothed = cur + (target - cur) * rise_speed
-        local instant = target * 0.9  -- hetkellinen komponentti, piikki näkyy heti
-        state.grid_col_display[x] = clamp(math.max(smoothed, instant), 0, 1)
+        if target > cur then
+          state.grid_col_display[x] = target
+        else
+          state.grid_col_display[x] = clamp(cur + (target - cur) * rise_speed, 0, 1)
+        end
       end
 
+      local rows_m1 = rows - 1
       for x = 1, cols do
         local col_level = state.grid_col_display[x] or 0
         local lit_rows_x = amp_to_lit_rows(col_level, vu_floor, rows)
-        local is_pitch_col = (pitch_x and x == pitch_x)
+        local inv_ht = (lit_rows_x > 1) and (1 / (lit_rows_x - 1)) or 0
         for i = 0, lit_rows_x - 1 do
           local y = rows - i
-          if y >= 1 and y <= rows then
-            local brightness = clamp(4 + round(11 * (i / math.max(1, lit_rows_x - 1))), 4, 15)
-            if is_pitch_col then
-              brightness = math.min(15, brightness + 2)
-            end
+          if y >= 1 then
+            local brightness = (lit_rows_x > 1) and clamp(4 + round(11 * (i * inv_ht)), 4, 15) or 8
+            if pitch_x and x == pitch_x then brightness = math.min(15, brightness + 2) end
             g:led(x, y, brightness)
           end
         end
-        if lit_rows_x < 1 then
-          g:led(x, rows, 1)
-        end
+        if lit_rows_x < 1 then g:led(x, rows, 1) end
       end
     end
 
@@ -241,7 +255,7 @@ function GridVisualizer:setup()
   end
   self.redraw_metro = metro.init()
   if self.redraw_metro then
-    self.redraw_metro.time = 1 / 50  -- 50 Hz = lyhyempi viive kuin 30 Hz
+    self.redraw_metro.time = 1 / 60  -- 60 Hz = minimaalinen viive, synkkaa analyysiin
     self.redraw_metro.event = function()
       pcall(function() self:draw() end)
     end

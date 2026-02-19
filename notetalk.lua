@@ -71,6 +71,7 @@ local state = {
   pitch_conf = 0,
   amp_norm = 0,
   amp_pulse = 0,
+  amp_for_vu = 0,  -- jatkuva taso ilman trigger-pulssia, jotta VU = volume eikä "viimeisin isku"
   amp_floor_est = 0,
   amp_ceil_est = 0.1,
   pitch_midi = nil,
@@ -90,6 +91,8 @@ local state = {
   vu_test_mode = false,  -- Oletuksena pois: grid näyttää oikean äänen tason
   grid_col_amp = {},   -- per-sarake: kohdetaso (decay)
   grid_col_display = {}, -- per-sarake: näytetty taso (smooth rise)
+  -- Norns engine can return nil on later lookup; store refs when engine loads (see init).
+  synth_engine = nil,  -- { hz, amp, level, noteOn, noteOff } when loaded
 }
 
 local amp_poll = nil
@@ -306,11 +309,16 @@ local function apply_engine_settings()
   local target_level = synth_on and synth_level or 0
   pcall(function() audio.level_eng_cut(target_level) end)
 
-  -- Only call engine commands if they exist
-  if pcall(function() return engine.level ~= nil end) then
+  -- Use stored engine refs when available (norns engine.* can be nil later).
+  local eng = state.synth_engine
+  if eng and eng.level then
+    pcall(eng.level, target_level)
+  elseif pcall(function() return engine.level ~= nil end) then
     pcall(function() engine.level(target_level) end)
   end
-  if pcall(function() return engine.amp ~= nil end) then
+  if eng and eng.amp then
+    pcall(eng.amp, target_level)
+  elseif pcall(function() return engine.amp ~= nil end) then
     pcall(function() engine.amp(target_level) end)
   end
   if pcall(function() return engine.reverb_send ~= nil end) then
@@ -514,31 +522,73 @@ end
 
 local function trigger_synth(note, amp)
   if params:string("use_synth") ~= "on" then
+    print("notetalk: SYNTH skip (use_synth=off)")
     return
   end
 
   local synth_level = params:get("synth_level")
-  -- Re-apply engine routing and level so notes are guaranteed to be audible.
   apply_engine_settings()
+  pcall(function() audio.level_eng_cut(synth_level) end)
 
   local hz = musicutil.note_num_to_freq(note)
   local amp_norm = clamp(amp or 0.2, 0, 1)
-  -- Higher floor and scale so notes are clearly audible (0.5–1.0 range before synth_level).
   local level = clamp(0.5 + (amp_norm * 0.5), 0, 1) * synth_level
   level = clamp(level, 0, 1)
 
-  pcall(function() engine.hz(hz) end)
+  -- Debug: varmista että syna yrittää soittaa (näkyy Maidenissa)
+  print("notetalk: SYNTH play note=" .. tostring(note) .. " hz=" .. string.format("%.1f", hz) .. " level=" .. string.format("%.2f", level) .. " eng_cut=" .. string.format("%.2f", synth_level))
 
-  -- Prefer gated engines when available; otherwise trigger as one-shot.
-  local ok_note_on = pcall(function() engine.noteOn(level) end)
+  -- Lazy capture: if init deferred block hasn't run yet, try to capture engine refs once.
+  if not state.synth_engine then
+    local h, a, l = engine.hz, engine.amp, engine.level
+    if h and a and l and type(h) == "function" and type(a) == "function" and type(l) == "function" then
+      state.synth_engine = { hz = h, amp = a, level = l, noteOn = engine.noteOn, noteOff = engine.noteOff }
+      print("notetalk: SYNTH engine refs captured on first trigger")
+    end
+  end
+
+  -- Use stored engine refs (norns engine.* can be nil on later lookup).
+  local eng = state.synth_engine
+  local ok_l, err_l = true
+  local ok_a, err_a = true
+  local ok_h, err_h = true
+  if eng and eng.level then
+    ok_l, err_l = pcall(eng.level, level)
+  else
+    ok_l, err_l = pcall(function() engine.level(level) end)
+  end
+  if eng and eng.amp then
+    ok_a, err_a = pcall(eng.amp, level)
+  else
+    ok_a, err_a = pcall(function() engine.amp(level) end)
+  end
+  if eng and eng.hz then
+    ok_h, err_h = pcall(eng.hz, hz)
+  else
+    ok_h, err_h = pcall(function() engine.hz(hz) end)
+  end
+  if not ok_l then print("notetalk: SYNTH engine.level failed: " .. tostring(err_l)) end
+  if not ok_a then print("notetalk: SYNTH engine.amp failed: " .. tostring(err_a)) end
+  if not ok_h then print("notetalk: SYNTH engine.hz failed: " .. tostring(err_h)) end
+
+  -- Engines that use noteOn: trigger explicitly and schedule noteOff.
+  local ok_note_on = false
+  if eng and eng.noteOn and type(eng.noteOn) == "function" then
+    ok_note_on = pcall(eng.noteOn, level)
+  else
+    ok_note_on = pcall(function() engine.noteOn(level) end)
+  end
   if ok_note_on then
     defer_clock(function()
       clock.sleep(params:get("note_length_ms") / 1000)
       if state.freeze then return end
-      pcall(function() engine.noteOff() end)
+      local e = state.synth_engine
+      if e and e.noteOff and type(e.noteOff) == "function" then
+        pcall(e.noteOff)
+      else
+        pcall(function() engine.noteOff() end)
+      end
     end)
-  else
-    pcall(function() engine.amp(level) end)
   end
 end
 
@@ -560,6 +610,9 @@ local function handle_analysis_event(event)
   state.last_event_midi = note
   state.last_event_conf = event.confidence
   state.last_event_amp = event.amp
+
+  -- Debug: varmista matron-lokissa että trigger tapahtui (näkyy Maidenissa)
+  print("notetalk: TRIGGER note=" .. tostring(note) .. " hz=" .. string.format("%.1f", event.hz) .. " amp=" .. string.format("%.2f", event.amp or 0))
 
   if midi_out then
     pcall(function()
@@ -880,6 +933,7 @@ local function setup_params()
   if grid_visualizer then
     grid_visualizer:add_params()
   end
+  params:add_option("vu_debug_screen", "VU Debug (screen)", {"off", "on"}, 1)
   params:bang()
 end
 
@@ -1078,10 +1132,11 @@ local function analyzer_loop()
       state.pitch_midi = current_pitch_midi()
     end
 
-    -- Sample-tilassa hieman hitaampi decay, jotta grid-VU näkyy transientin aallonpituudelta
     state.amp_pulse = state.amp_pulse * (sample_mode and 0.97 or 0.9)
     state.amp_norm = math.max(amp, state.amp_pulse)
-    
+    -- VU: jatkuva taso ilman amp_pulsea, jotta hiljaisella ei nouse "keskenään" (ei vanhaa triggeriä)
+    state.amp_for_vu = 0.88 * (state.amp_for_vu or 0) + 0.12 * amp
+
     -- VU: käytä suoraan raakaa signaalia ilman normalisointia, vahvistus jotta palkki liikkuu
     -- Sample-tilassa käytä ulostuloa, line-in-tilassa sisääntuloa
     local vu_raw = 0
@@ -1197,8 +1252,8 @@ function init()
   update_source_label()
   apply_engine_settings()
   
-  -- Ensure engine is loaded (shields may have no default engine)
-  -- Try multiple engines and methods to find one that works
+  -- Ensure engine is loaded BEFORE starting analyzer (so state.synth_engine is set before any trigger).
+  -- Try multiple engines and methods to find one that works.
   defer_clock(function()
     clock.sleep(0.15)
     if state.freeze then return end
@@ -1223,6 +1278,13 @@ function init()
           if has_hz or has_amp or has_level or has_noteOn then
             print("notetalk: engine " .. name .. " commands verified and tested")
             -- Capture function refs immediately (norns engine can return nil on later lookup)
+            state.synth_engine = {
+              hz = engine.hz,
+              amp = engine.amp,
+              level = engine.level,
+              noteOn = engine.noteOn,
+              noteOff = engine.noteOff,
+            }
             local noteOn_fn = engine.noteOn
             local noteOff_fn = engine.noteOff
             local hz_fn = engine.hz
@@ -1306,8 +1368,16 @@ function init()
     
     if not engine_loaded then
       print("notetalk: WARNING - failed to load any working engine")
+    else
+      -- Start analyzer only when engine is ready (so trigger_synth has state.synth_engine).
+      analysis_clock = clock.run(analyzer_loop)
     end
+    redraw()
   end)
+  
+  -- Start redraw immediately so UI is visible; analyzer starts after engine load in defer above.
+  redraw_clock = clock.run(redraw_loop)
+  redraw()
   
   -- Apply sample_level from params after a short delay (audio system ready)
   defer_clock(function()
@@ -1320,10 +1390,6 @@ function init()
     end
     pcall(function() softcut.level(1, sl) end)
   end)
-  
-  analysis_clock = clock.run(analyzer_loop)
-  redraw_clock = clock.run(redraw_loop)
-  redraw()
 end
 
 function enc(n, d)
@@ -1340,8 +1406,9 @@ function enc(n, d)
     params:set("synth_level", v)
     local synth_on = params:string("use_synth") == "on"
     local target_level = synth_on and v or 0
-    pcall(function() engine.amp(target_level) end)
-    pcall(function() engine.level(target_level) end)
+    local eng = state.synth_engine
+    if eng and eng.amp then pcall(eng.amp, target_level) else pcall(function() engine.amp(target_level) end) end
+    if eng and eng.level then pcall(eng.level, target_level) else pcall(function() engine.level(target_level) end) end
   end
   redraw()
 end
@@ -1388,7 +1455,7 @@ function redraw()
   if state.last_event_midi then
     last_text = string.format("last:n%d", state.last_event_midi)
   end
-  screen.text(string.format("%s h:%d", last_text, state.debug_hit_count))
+  screen.text(string.format("%s h:%d synth:%s", last_text, state.debug_hit_count, params:string("use_synth")))
 
   -- Right-edge 1px volume meters: sample (left) and note/synth (right).
   local meter_bottom = 63
@@ -1418,6 +1485,23 @@ function redraw()
     screen.move(127, meter_bottom)
     screen.line(127, meter_bottom - synth_pixels + 1)
     screen.stroke()
+  end
+
+  -- VU debug: näytä datat jotka syöttävät grid-visun (selvitetään synkkaongelmaa)
+  if params:get("vu_debug_screen") == 2 then
+    local an = state.amp_norm or 0
+    local av = state.amp_for_vu or 0
+    local vl = state.vu_level or 0
+    local out = math.max(state.amp_out_l or 0, state.amp_out_r or 0)
+    local inp = math.max(state.amp_in_l or 0, state.amp_in_r or 0)
+    screen.level(12)
+    screen.move(0, 52)
+    screen.text(string.format("VU an:%.2f av:%.2f vl:%.2f o:%.2f i:%.2f", an, av, vl, out, inp))
+    local p = state.normalized_pitch_midi or state.pitch_midi
+    local d1 = state.grid_col_display and state.grid_col_display[1] or 0
+    local d8 = state.grid_col_display and state.grid_col_display[8] or 0
+    screen.move(0, 60)
+    screen.text(string.format("pitch:%s d1:%.2f d8:%.2f src:%s", p and tostring(round(p)) or "-", d1, d8, state.source_label))
   end
 
   screen.update()
@@ -1452,9 +1536,10 @@ function cleanup()
     pitch_retry_metro = nil
   end
   
-  -- ENGINE CLEANUP - yksinkertainen
-  pcall(function() engine.amp(0) end)
-  pcall(function() engine.level(0) end)
+  -- ENGINE CLEANUP - use stored refs so engine actually receives the call
+  local eng = state.synth_engine
+  if eng and eng.amp then pcall(eng.amp, 0) else pcall(function() engine.amp(0) end) end
+  if eng and eng.level then pcall(eng.level, 0) else pcall(function() engine.level(0) end) end
   
   -- Audio service cleanup (yksinkertaistettu)
   if audio_service then
@@ -1464,6 +1549,7 @@ function cleanup()
   -- Reset state
   state.amp_norm = 0
   state.amp_pulse = 0
+  state.amp_for_vu = 0
   state.pitch_hz = nil
   state.pitch_conf = 0
   state.pitch_midi = nil
