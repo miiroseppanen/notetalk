@@ -4,7 +4,8 @@
 -- v1.0.0 @2026
 --  
 
-engine.name = "PolyPerc"
+-- Engine change can corrupt JACK state - use default engine instead
+-- engine.name = "PolyPerc"
 
 local fileselect = require "fileselect"
 local grid = require "grid"
@@ -13,9 +14,13 @@ local musicutil = require "musicutil"
 local Analyzer = include("lib/analyzer")
 local Mapping = include("lib/mapping")
 local MidiOut = include("lib/midi_out")
+local GridService = include("lib/grid_service")
+local AudioService = include("lib/audio_service")
 
 local analyzer
 local midi_out
+local grid_service
+local audio_service
 
 local state = {
   freeze = false,
@@ -49,6 +54,7 @@ local state = {
   phase_last_pos = nil,
   phase_pulse_t = 0,
   enc_shift = false,
+  amp_poll_restart_warned = false,
 }
 
 local amp_poll = nil
@@ -85,12 +91,10 @@ local deferred_clocks = {}
 local ENABLE_PHASE_MONITOR = false
 local phase_monitor_active = false
 local softcut_active = false
-local ENABLE_DEBUG_AUTOSAMPLE = false
-local DEBUG_ENABLED = false
+local ENABLE_DEBUG_AUTOSAMPLE = true
+local DEBUG_ENABLED = true
 
--- Forward declarations used by load_sample/cleanup before definitions.
-local setup_softcut_phase_monitor
-local clear_softcut_phase_monitor
+-- Softcut phase monitoring now handled by AudioService
 
 local function defer_clock(fn)
   local id = clock.run(fn)
@@ -301,29 +305,7 @@ local function apply_engine_settings()
   pcall(function() engine.delay_send(delay_send) end)
 end
 
-local function setup_softcut_defaults()
-  pcall(function() audio.level_dac(1.0) end)
-  pcall(function() audio.level_monitor(1.0) end)
-  pcall(function() audio.level_monitor_mix(1.0) end)
-  pcall(function() audio.level_tape(1.0) end)
-  pcall(function() audio.level_cut(1.0) end)
-  pcall(function() softcut.enable(1, 1) end)
-  pcall(function() softcut.buffer(1, 1) end)
-  pcall(function() softcut.level(1, 1) end)
-  pcall(function() softcut.level_input_cut(1, 1, 0) end)
-  pcall(function() softcut.level_input_cut(2, 1, 0) end)
-  pcall(function() softcut.rec_level(1, 0) end)
-  pcall(function() softcut.pre_level(1, 1) end)
-  pcall(function() softcut.rec(1, 0) end)
-  pcall(function() softcut.pan(1, 0) end)
-  pcall(function() softcut.rate(1, 1) end)
-  pcall(function() softcut.loop(1, 1) end)
-  pcall(function() softcut.loop_start(1, 0) end)
-  pcall(function() softcut.loop_end(1, 4) end)
-  pcall(function() softcut.position(1, 0) end)
-  pcall(function() softcut.play(1, 0) end)
-  softcut_active = true
-end
+-- Moved to AudioService
 
 local function load_sample(path, attempt)
   if not path or path == "" then
@@ -331,36 +313,13 @@ local function load_sample(path, attempt)
   end
   attempt = attempt or 1
 
-  local ok, err = pcall(function()
-    setup_softcut_defaults()
-    setup_softcut_phase_monitor()
-    softcut.buffer_clear()
-    softcut.buffer_read_mono(path, 0, 0, -1, 1, 1, 0)
-    softcut.position(1, 0)
-    softcut.play(1, 1)
-  end)
-
-  if ok then
+  local success = audio_service:load_sample(path, defer_clock)
+  if success then
     state.sample_loaded = true
     state.sample_path = path
-    print("notetalk sample loaded: " .. path)
-
-    local _, frames, sample_rate = audio.file_info(path)
-    if frames and sample_rate and sample_rate > 0 then
-      local duration = frames / sample_rate
-      pcall(function() softcut.loop_end(1, math.max(0.2, duration)) end)
-    end
-    -- Ensure playback is running after read starts.
-    defer_clock(function()
-      clock.sleep(0.1)
-      if state.freeze then return end
-      pcall(function() softcut.position(1, 0) end)
-      pcall(function() softcut.play(1, 1) end)
-    end)
   else
     state.sample_loaded = false
     state.sample_path = nil
-    print(string.format("notetalk sample load failed (attempt %d): %s", attempt, tostring(err)))
     if attempt < 2 then
       defer_clock(function()
         clock.sleep(0.2)
@@ -437,9 +396,9 @@ clear_softcut_phase_monitor = function()
 end
 
 local function unload_sample()
+  audio_service:unload_sample()
   state.sample_loaded = false
   state.sample_path = nil
-  pcall(function() softcut.play(1, 0) end)
   update_source_label()
   redraw()
 end
@@ -558,8 +517,8 @@ local function setup_polls()
 
   local pitch_poll_name = "none"
   local conf_poll_name = "none"
-  local pitch_poll_names = {"pitch_in", "pitch_out"}
-  local conf_poll_names = {"pitch_conf", "pitch_out_conf"}
+  local pitch_poll_names = {"pitch_in", "pitch_out", "pitch", "in_pitch"}
+  local conf_poll_names = {"pitch_conf", "pitch_out_conf", "conf", "pitch_confidence", "in_pitch_conf"}
 
   local function try_setup_pitch_and_conf()
     if not pitch_poll then
@@ -625,6 +584,33 @@ local function setup_polls()
       end
     end
     pitch_retry_metro:start()
+  end
+  
+  -- Health check for amp polls - restart if they seem dead
+  if state.now_ms and state.now_ms > 5000 then -- Only after 5 seconds of runtime
+    local total_amp = (state.amp_in_l or 0) + (state.amp_in_r or 0) + (state.amp_out_l or 0) + (state.amp_out_r or 0)
+    if total_amp <= 0.0001 and not state.amp_poll_restart_warned then
+      debug_log("H13", "notetalk.lua:setup_polls", "amp_polls_dead", {
+        amp_in_l = state.amp_in_l or -1,
+        amp_in_r = state.amp_in_r or -1, 
+        amp_out_l = state.amp_out_l or -1,
+        amp_out_r = state.amp_out_r or -1,
+        total_amp = total_amp
+      })
+      -- Try to restart amp polls
+      if amp_poll then amp_poll:stop(); amp_poll = nil; end
+      if amp_poll_aux then amp_poll_aux:stop(); amp_poll_aux = nil; end
+      if amp_poll_in_l then amp_poll_in_l:stop(); amp_poll_in_l = nil; end
+      if amp_poll_in_r then amp_poll_in_r:stop(); amp_poll_in_r = nil; end
+      
+      amp_poll = try_poll("amp_out_l", function(value) state.amp_out_l = math.abs(value or 0) end)
+      amp_poll_aux = try_poll("amp_out_r", function(value) state.amp_out_r = math.abs(value or 0) end)
+      amp_poll_in_l = try_poll("amp_in_l", function(value) state.amp_in_l = math.abs(value or 0) end)
+      amp_poll_in_r = try_poll("amp_in_r", function(value) state.amp_in_r = math.abs(value or 0) end)
+      
+      state.amp_poll_restart_warned = true
+      print("notetalk: amp polls restarted due to silence")
+    end
   end
 end
 
@@ -821,6 +807,17 @@ local function setup_debug_sample_defaults()
   -- #endregion
 end
 
+local function schedule_debug_sample_defaults()
+  defer_clock(function()
+    -- Short delay avoids first-frame race while keeping startup autoload behavior.
+    clock.sleep(0.25)
+    if state.freeze then
+      return
+    end
+    setup_debug_sample_defaults()
+  end)
+end
+
 local function update_grid_dimensions()
   if g then
     grid_cols = g.cols or 0
@@ -832,36 +829,9 @@ local function update_grid_dimensions()
 end
 
 set_active_line_from_event = function(event)
-  if not grid_is_ready() then
-    return
+  if grid_service then
+    grid_service:on_analysis_event(event)
   end
-
-  local min_conf = params:get("min_conf")
-  local conf = clamp(event.confidence or 0, 0, 1)
-  if conf < min_conf then
-    return
-  end
-
-  local pitch_midi = Mapping.hz_to_midi(event.hz)
-  local pitch_min = params:get("pitch_min_midi")
-  local pitch_max = params:get("pitch_max_midi")
-  onset_x = pitch_to_x(pitch_midi, grid_cols, pitch_min, pitch_max)
-
-  local selected_line_mode = params:string("line_mode")
-  local y = grid_rows
-  if selected_line_mode == "onset" then
-    local onset_lit = amp_to_lit_rows(event.amp or 0, params:get("vu_floor"), grid_rows)
-    if onset_lit == 0 then
-      y = grid_rows
-    else
-      y = clamp(grid_rows - onset_lit + 1, 1, grid_rows)
-    end
-  else
-    y = threshold_to_y(params:get("threshold"), params:get("vu_floor"), grid_rows)
-  end
-
-  active_line_y = y
-  active_line_t0 = util.time()
 end
 
 local function grid_redraw()
@@ -987,59 +957,34 @@ local function grid_redraw()
 end
 
 local function setup_grid()
-  g = grid.connect(1)
-  update_grid_dimensions()
-  grid_not_ready_ticks = 0
-  -- #region agent log
-  debug_log("H1", "notetalk.lua:setup_grid", "grid_connect", {
-    cols = grid_cols,
-    rows = grid_rows,
-    grid_connected = (g ~= nil),
+  grid_service = GridService.new({
+    params = params,
+    get_signal = function()
+      return {
+        amp_norm = state.amp_norm,
+        pitch_midi = state.pitch_midi,
+        pitch_conf = state.pitch_conf,
+        min_conf = params:get("min_conf"),
+        pitch_min = params:get("pitch_min_midi"),
+        pitch_max = params:get("pitch_max_midi"),
+        vu_floor = params:get("vu_floor"),
+        vu_mode = params:string("vu_mode"),
+      }
+    end,
+    hz_to_midi = Mapping.hz_to_midi,
+    clamp = clamp,
+    round = round,
+    line_fade_ms = LINE_FADE_MS,
+    grid_recover_ticks = GRID_RECOVER_TICKS,
+    debug_log = debug_log,
+    debug_should_log = debug_should_log,
   })
-  -- #endregion
-  if grid_is_ready() then
-    apply_grid_defaults_for_size(grid_cols, grid_rows)
-  end
-
-  if g then
-    g.key = function(_, _, _) end
-  end
-
-  grid.add = function()
-    g = grid.connect(1)
-    update_grid_dimensions()
-    grid_not_ready_ticks = 0
-    if grid_is_ready() then
-      apply_grid_defaults_for_size(grid_cols, grid_rows)
-      last_valid_x = nil
-      onset_x = nil
-      active_line_y = nil
-      active_line_t0 = nil
-    end
-  end
-
-  grid.remove = function()
-    update_grid_dimensions()
-    if not grid_is_ready() then
-      g = nil
-      grid_cols = 0
-      grid_rows = 0
-      grid_not_ready_ticks = 0
-      last_valid_x = nil
-      onset_x = nil
-      active_line_y = nil
-      active_line_t0 = nil
-    end
-  end
-
-  grid_redraw_metro = metro.init()
-  grid_redraw_metro.time = 1 / 30
-  grid_redraw_metro.event = grid_redraw
-  grid_redraw_metro:start()
+  grid_service:setup()
 end
 
 local function analyzer_loop()
   local previous_amp = 0
+  local poll_check_counter = 0
 
   while true do
     clock.sleep(1 / 60)
@@ -1048,6 +993,13 @@ local function analyzer_loop()
 
     if state.freeze then
       goto continue
+    end
+    
+    -- Check poll health every ~1 second (60 loops / 60 = 1 sec)
+    poll_check_counter = poll_check_counter + 1
+    if poll_check_counter >= 60 then
+      poll_check_counter = 0
+      setup_polls() -- This will now auto-restart dead amp polls
     end
 
     update_source_label()
@@ -1071,6 +1023,27 @@ local function analyzer_loop()
         state.amp_in_r or 0
       )
     end
+    
+    -- Debug: check if we're getting signal
+    if debug_should_log("signal_check", 5.0) then
+      debug_log("H12", "notetalk.lua:analyzer_loop", "signal_values", {
+        amp_raw = amp_raw,
+        amp_in_l = state.amp_in_l or -1,
+        amp_in_r = state.amp_in_r or -1,
+        amp_out_l = state.amp_out_l or -1,
+        amp_out_r = state.amp_out_r or -1,
+        pitch_hz = state.pitch_hz or -1,
+        pitch_conf = state.pitch_conf or -1,
+        sample_mode = sample_mode,
+        polls_active = {
+          amp_poll = (amp_poll ~= nil),
+          amp_poll_aux = (amp_poll_aux ~= nil),
+          pitch_poll = (pitch_poll ~= nil),
+          conf_poll = (conf_poll ~= nil),
+          pitch_retry_metro = (pitch_retry_metro ~= nil)
+        }
+      })
+    end
     local amp = clamp(amp_raw, 0, 1)
     local pitch = state.pitch_hz
     local confidence = clamp(state.pitch_conf or 0, 0, 1)
@@ -1083,10 +1056,26 @@ local function analyzer_loop()
     if sample_mode then
       -- Adaptive normalization for more expressive fallback pitch mapping.
       state.amp_floor_est = (state.amp_floor_est * 0.995) + (amp * 0.005)
-      state.amp_ceil_est = math.max(amp, state.amp_ceil_est * 0.998)
-      local span_for_amp = math.max(0.00001, state.amp_ceil_est - state.amp_floor_est)
-      amp = clamp((amp - state.amp_floor_est) / span_for_amp, 0, 1)
-      amp_trigger_metric = amp
+      -- Slower ceiling decay to prevent huge spikes from killing sensitivity
+      state.amp_ceil_est = math.max(amp, state.amp_ceil_est * 0.99)
+      
+      local span_for_amp = math.max(0.001, state.amp_ceil_est - state.amp_floor_est)
+      local normalized_amp = clamp((amp - state.amp_floor_est) / span_for_amp, 0, 1)
+      
+      -- Use raw amp for trigger decisions, normalized amp for display/grid
+      amp_trigger_metric = amp  -- Use raw signal for onset detection
+      amp = normalized_amp      -- Use normalized for display
+      
+      if debug_should_log("normalization", 4.0) then
+        debug_log("H14", "notetalk.lua:analyzer_loop", "normalization", {
+          amp_raw = amp_raw,
+          amp_normalized = normalized_amp,
+          amp_trigger_metric = amp_trigger_metric,
+          amp_floor_est = state.amp_floor_est,
+          amp_ceil_est = state.amp_ceil_est,
+          span = span_for_amp
+        })
+      end
     else
       amp_trigger_metric = amp
     end
@@ -1219,6 +1208,10 @@ local function redraw_loop()
 end
 
 function init()
+  if grid_service then
+    grid_service:stop()
+    grid_service = nil
+  end
   if grid_redraw_metro then
     grid_redraw_metro:stop()
     grid_redraw_metro = nil
@@ -1238,21 +1231,24 @@ function init()
     window_ms = 120,
   })
   midi_out = MidiOut.new()
+  audio_service = AudioService.new()
 
   -- Keep softcut defaults ready at init time (without phase polling) to avoid racey first-load failures.
-  setup_softcut_defaults()
+  audio_service:setup_defaults()
   setup_params()
   setup_polls()
   setup_grid()
   if ENABLE_DEBUG_AUTOSAMPLE then
-    setup_debug_sample_defaults()
+    schedule_debug_sample_defaults()
   end
   update_source_label()
   apply_engine_settings()
   play_boot_test_tone()
 
+  print("notetalk: starting analyzer and redraw loops")
   analysis_clock = clock.run(analyzer_loop)
   redraw_clock = clock.run(redraw_loop)
+  print("notetalk: loops started, analysis_clock=" .. tostring(analysis_clock))
   redraw()
 end
 
@@ -1367,9 +1363,50 @@ function cleanup()
     pcall(clock.cancel, id)
   end
   deferred_clocks = {}
+  print("notetalk cleanup: deferred clocks cancelled")
   cleanup_polls()
-  clear_softcut_phase_monitor()
-  softcut_active = false
+  print("notetalk cleanup: polls stopped")
+  if midi_out then
+    midi_out:cleanup()
+    print("notetalk cleanup: midi_out cleaned")
+  end
+  if grid_service then
+    grid_service:stop()
+    print("notetalk cleanup: grid_service stopped")
+    grid_service = nil
+  end
+  -- ENGINE CLEANUP FIRST - most critical for JACK stability
+  print("notetalk cleanup: engine cleanup start")
+  pcall(function() engine.amp(0) end)
+  pcall(function() engine.level(0) end)
+  
+  -- Force engine reset to prevent JACK corruption
+  local current_engine = engine.name
+  if current_engine and current_engine ~= "" and current_engine ~= "None" then
+    print("notetalk cleanup: resetting engine from " .. current_engine)
+    pcall(function() 
+      engine.name = "None"
+      clock.sleep(0.1)
+      engine.name = current_engine  -- Restore original engine
+    end)
+  end
+  print("notetalk cleanup: engine cleanup complete")
+  
+  -- THEN audio service cleanup
+  print("notetalk cleanup: clearing audio service")
+  if audio_service then
+    audio_service:cleanup()
+    print("notetalk cleanup: audio_service cleaned")
+  end
+  
+  -- Extended JACK settlement period to prevent crone crash
+  print("notetalk cleanup: extended JACK settlement...")
+  for i = 1, 30 do
+    pcall(function() 
+      clock.sleep(0.01)
+    end)
+  end
+  print("notetalk cleanup: JACK settlement complete")
   state.amp_norm = 0
   state.amp_pulse = 0
   state.pitch_hz = nil
@@ -1386,7 +1423,9 @@ function cleanup()
   if grid_redraw_metro then grid_redraw_metro:stop() end
   if analysis_clock then clock.cancel(analysis_clock) end
   if redraw_clock then clock.cancel(redraw_clock) end
+  print("notetalk cleanup: main clocks cancelled")
   grid_redraw_metro = nil
   analysis_clock = nil
   redraw_clock = nil
+  print("notetalk cleanup end")
 end

@@ -21,6 +21,7 @@ function MidiOut.new()
   self.fixed_velocity = 100
   self.send_enabled = true
   self.conn = midi.connect(self.device_id)
+  self.pending_clocks = {}
   return self
 end
 
@@ -97,7 +98,7 @@ function MidiOut:trigger_note(note, amp)
   if not ok_on then
     return
   end
-  clock.run(function()
+  local note_off_clock = clock.run(function()
     clock.sleep(self.note_length_ms / 1000)
     if self.conn then
       pcall(function()
@@ -105,6 +106,14 @@ function MidiOut:trigger_note(note, amp)
       end)
     end
   end)
+  table.insert(self.pending_clocks, note_off_clock)
+end
+
+function MidiOut:cleanup()
+  for _, id in ipairs(self.pending_clocks) do
+    pcall(clock.cancel, id)
+  end
+  self.pending_clocks = {}
 end
 
 return MidiOut
