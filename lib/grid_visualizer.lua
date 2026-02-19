@@ -1,5 +1,6 @@
--- Grid Visualizer: VU + pitch visualisointi gridille
--- Eriytetty notetalk.lua:sta. Käyttää statea, paramsia ja source_is_sample()-funktiota.
+-- Grid Visualizer: spektrinäkymä (X = taajuus Hz, Y = amplitudi)
+-- Pseudo-spektri: X = pitch-sijainti (vasen = matala, oikea = korkea), Y = palkin korkeus = taso.
+-- Pitch löytyy = yksi piikki; pitch puuttuu = tasainen levy (broadband). Käyttää statea ja paramsia.
 
 local GridVisualizer = {}
 GridVisualizer.__index = GridVisualizer
@@ -142,8 +143,12 @@ function GridVisualizer:draw()
       else
         vu_raw = clamp(state.vu_level or 0, 0, 1)
       end
-      -- VU-käyrä: lievä nosto matalille, max vain oikeasti koville piikeille (power > 0.5)
+      -- Spektrinäkymä: X = taajuus (pitch), Y = amplitudi. VU-käyrä nostaa matalia.
       local vu_amp = vu_curve(vu_raw, 0.68)
+      -- Heikko signaali: pakota taso niin että palkki nousee (vu_floor default 0.08)
+      if vu_raw > 0.005 and vu_amp < 0.15 then
+        vu_amp = math.max(vu_amp, 0.15)
+      end
 
       local pitch_min = params:get("pitch_min_midi") or 36
       local pitch_max = params:get("pitch_max_midi") or 96
@@ -152,8 +157,8 @@ function GridVisualizer:draw()
       if pitch_midi_grid and pitch_midi_grid >= pitch_min and pitch_midi_grid <= pitch_max then
         pitch_x = pitch_to_x(pitch_midi_grid, cols, pitch_min, pitch_max)
       end
-      local decay = sample_mode and 0.46 or 0.70   -- nopea putoaminen, erityisesti line-in
-      local rise_speed = sample_mode and 1.0 or 0.55  -- nopeampi lasku line-in
+      local decay = sample_mode and 0.46 or 0.82   -- line-in: kompromissi näkyvyys vs. reaktio
+      local rise_speed = sample_mode and 1.0 or 0.55
       local spread_radius = math.max(2, math.floor(cols * 0.35))
       local spread_inv = 1 / (spread_radius + 1)
       for x = 1, cols do
@@ -188,7 +193,15 @@ function GridVisualizer:draw()
           end
         end
       end
-      -- Nousu = välitön (target), lasku = tasoitettu → minimaalinen reaktioaika
+      -- Kun signaalia on: pakota vähintään yksi sarake näkyviin (vu_floor voi olla 0.08)
+      -- amp_to_lit_rows(level, 0.08, 8) tarvitsee level >= 0.14 yhdelle riville
+      if vu_raw > 0.005 then
+        local center_col = math.floor(cols * 0.5) + 1
+        center_col = clamp(center_col, 1, cols)
+        local cur_center = state.grid_col_amp[center_col] or 0
+        state.grid_col_amp[center_col] = math.max(cur_center, 0.28)
+      end
+      -- Nousu = välitön (target), lasku = tasoitettu
       for x = 1, cols do
         local target = state.grid_col_amp[x] or 0
         local cur = state.grid_col_display[x] or 0

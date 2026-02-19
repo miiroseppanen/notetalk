@@ -10,10 +10,17 @@ end
 function AudioOutput:setup()
   pcall(function() audio.level_dac(1.0) end)
   pcall(function() audio.level_cut(1.0) end)
+  pcall(function() audio.level_eng(1.0) end)
+  pcall(function() audio.level_monitor(0) end)
 end
 
 function AudioOutput:set_engine_cut_level(level)
-  pcall(function() audio.level_eng_cut(level or 0) end)
+  local L = level and level > 0 and level or 0
+  pcall(function() audio.level_eng_cut(L) end)
+  if L > 0 then
+    pcall(function() audio.level_eng(1.0) end)
+    pcall(function() audio.level_cut(1.0) end)
+  end
 end
 
 function AudioOutput:cleanup()

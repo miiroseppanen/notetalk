@@ -31,10 +31,11 @@ function OnsetService.detect(opts)
     end
   end
 
+  local refractory_ms = math.max(hold_ms, opts.debounce_ms or 0)
   local amp_delta = amp_trigger_metric - previous_amp
   local onset_candidate = amp_trigger_metric >= effective_threshold
-  local onset_rise_ok = amp_delta >= 0.002
-  local refractory_ok = (now_ms - last_trigger_ms) >= hold_ms
+  local onset_rise_ok = amp_delta >= 0.001
+  local refractory_ok = (now_ms - last_trigger_ms) >= refractory_ms
   local onset_accept = onset_candidate and onset_rise_ok and refractory_ok
 
   local trigger_amp = 0

@@ -12,9 +12,9 @@ end
 function VUAnalyzer.new(opts)
   local self = setmetatable({}, VUAnalyzer)
   self.state = opts.state
-  self.vu_decay = opts.vu_decay or 0.96
+  self.vu_decay = opts.vu_decay or 0.92   -- 0.85–0.95: less lag, spec
   self.amp_for_vu_alpha = opts.amp_for_vu_alpha or 0.28
-  self.vu_gain = opts.vu_gain or 15
+  self.vu_gain = opts.vu_gain or 20
   return self
 end
 
@@ -54,7 +54,9 @@ function VUAnalyzer:update(opts)
   state.amp_for_vu = 0.88 * (state.amp_for_vu or 0) + self.amp_for_vu_alpha * amp
 
   local vu_raw = 0
-  if sample_mode then
+  if opts.amp_for_vu_override ~= nil then
+    vu_raw = opts.amp_for_vu_override
+  elseif sample_mode then
     vu_raw = math.max(state.amp_out_l or 0, state.amp_out_r or 0)
   else
     vu_raw = math.max(state.amp_in_l or 0, state.amp_in_r or 0)

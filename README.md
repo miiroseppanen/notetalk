@@ -30,7 +30,21 @@ Syncs to `/home/we/dust/code/notetalk/`. If auto-load fails, run script from Nor
   - **grid_controller** — grid connect; wraps **grid_visualizer** (VU/pitch on grid).
   - **analyzer** — observation processing; **mapping** — scales, hz→midi; **midi_out** — MIDI note output.
 
+## Debug / log
+
+Script `print()` output appears in:
+
+1. **Maiden** (easiest): open `http://norns.local` (or your hostname), run the script; the REPL/console shows notetalk lines (e.g. `notetalk: SYNTH ...`, `notetalk: TRIGGER ...`).
+2. **Terminal (SSH)**:
+   ```bash
+   ssh we@norns-shield.local   # or we@norns.local
+   journalctl -f
+   ```
+   Filter for notetalk: `journalctl -f | grep notetalk`
+
+Look for: `SYNTH engine loaded`, `SYNTH note played`, `SYNTH skip (engine not loaded)`, `SYNTH engine.hz failed`, etc.
+
 ## If something breaks
 
-- **No sound**: Check matron logs (`sudo journalctl -u norns-matron -f`). Script tries engines PolyPerc → TestSine → SimplePassThru.
+- **No sound**: Check logs (see above). Script tries engines PolyPerc → TestSine → SimplePassThru; `eng_cut` (engine→mix level) must be > 0 when Use Synth is on.
 - **Restart stuck**: `ssh we@norns.local`, then stop matron/sclang/crone, restart norns-jack, sleep 2, start crone/sclang/matron.

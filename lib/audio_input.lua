@@ -6,6 +6,10 @@ AudioInput.__index = AudioInput
 
 local PITCH_POLL_NAMES = {"pitch_in", "pitch_out", "pitch", "in_pitch"}
 local CONF_POLL_NAMES = {"pitch_conf", "pitch_out_conf", "conf", "pitch_confidence", "in_pitch_conf"}
+-- SC/cut-bus analysis (when Input Mode = softcut); engine must send these
+local SC_AMP_POLL_NAMES = {"amp_cut", "amp_sc"}
+local SC_PITCH_POLL_NAMES = {"pitch_cut", "pitch_sc"}
+local SC_CONF_POLL_NAMES = {"pitch_cut_conf", "pitch_sc_conf"}
 
 function AudioInput.new(opts)
   local self = setmetatable({}, AudioInput)
@@ -17,6 +21,9 @@ function AudioInput.new(opts)
   self.pitch_poll = nil
   self.conf_poll = nil
   self.pitch_retry_metro = nil
+  self.amp_sc_poll = nil
+  self.pitch_sc_poll = nil
+  self.conf_sc_poll = nil
   return self
 end
 
@@ -54,6 +61,20 @@ function AudioInput:setup()
   end
 
   try_setup_pitch_and_conf()
+
+  -- SC/cut-bus polls for softcut-mode analysis (work when SC engine sends these)
+  for _, name in ipairs(SC_AMP_POLL_NAMES) do
+    self.amp_sc_poll = try_poll(name, function(value) state.amp_sc = value and math.abs(value) or 0 end)
+    if self.amp_sc_poll then break end
+  end
+  for _, name in ipairs(SC_PITCH_POLL_NAMES) do
+    self.pitch_sc_poll = try_poll(name, function(value) state.pitch_sc = value end)
+    if self.pitch_sc_poll then break end
+  end
+  for _, name in ipairs(SC_CONF_POLL_NAMES) do
+    self.conf_sc_poll = try_poll(name, function(value) state.pitch_sc_conf = value end)
+    if self.conf_sc_poll then break end
+  end
 
   if (not self.pitch_poll) or (not self.conf_poll) then
     if self.pitch_retry_metro then
@@ -144,6 +165,9 @@ function AudioInput:cleanup()
   if self.amp_poll_in_r then self.amp_poll_in_r:stop() end
   if self.pitch_poll then self.pitch_poll:stop() end
   if self.conf_poll then self.conf_poll:stop() end
+  if self.amp_sc_poll then self.amp_sc_poll:stop() end
+  if self.pitch_sc_poll then self.pitch_sc_poll:stop() end
+  if self.conf_sc_poll then self.conf_sc_poll:stop() end
   if self.pitch_retry_metro then self.pitch_retry_metro:stop() end
   self.amp_poll = nil
   self.amp_poll_aux = nil
@@ -151,6 +175,9 @@ function AudioInput:cleanup()
   self.amp_poll_in_r = nil
   self.pitch_poll = nil
   self.conf_poll = nil
+  self.amp_sc_poll = nil
+  self.pitch_sc_poll = nil
+  self.conf_sc_poll = nil
   self.pitch_retry_metro = nil
 end
 

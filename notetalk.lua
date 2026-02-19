@@ -102,6 +102,10 @@ local state = {
   -- Norns engine can return nil on later lookup; store refs when engine loads (see init).
   synth_engine = nil,  -- { hz, amp, level, noteOn, noteOff } when loaded
   engine_ready = false,  -- true after init_engine has loaded and verified engine (K3 test waits for this)
+  -- Softcut-mode analysis from SC (cut bus): filled when SC engine sends amp_cut, pitch_cut, pitch_cut_conf
+  amp_sc = nil,
+  pitch_sc = nil,
+  pitch_sc_conf = nil,
 }
 
 local analysis_clock = nil
@@ -531,7 +535,7 @@ end
 
 local function add_analysis_params()
   params:add_separator("analysis_sep", "Analysis")
-  params:add_control("threshold", "Threshold", controlspec.new(0.001, 1, "lin", 0, 0.02, ""))
+  params:add_control("threshold", "Threshold", controlspec.new(0.001, 1, "lin", 0, 0.01, ""))
   params:set_action("threshold", function(value)
     analyzer:set_threshold(value)
   end)
@@ -546,6 +550,9 @@ local function add_analysis_params()
     analyzer:set_hold_ms(value)
   end)
 
+  params:add_number("onset_debounce_ms", "Onset Debounce (ms)", 80, 150, 100)
+  params:add_number("timing_offset_ms", "Timing Offset (ms)", -100, 200, 60)
+
   params:add_number("window_ms", "Pitch Window (ms)", 20, 800, 120)
   params:set_action("window_ms", function(value)
     analyzer:set_window_ms(value)
@@ -554,6 +561,7 @@ end
 
 local function add_mapping_params()
   params:add_separator("mapping_sep", "Mapping")
+  params:add_number("bpm", "BPM (0=off)", 0, 240, 0)
   params:add_option("scale", "Scale", SCALE_NAMES, 2)
   params:add_number("scale_root", "Scale Root (semitone)", 0, 11, 0)
   params:add_number("octave_shift", "Octave Shift", -3, 3, 0)
@@ -668,19 +676,20 @@ end
 local function analyzer_loop()
   local previous_amp = 0
   local poll_check_counter = 0
+  local ANALYZER_HZ = 100  -- poll rate for analysis (spec: 100 Hz)
+  local now_inc_ms = 1000 / ANALYZER_HZ
 
   while true do
-    clock.sleep(1 / 60)
-    state.now_ms = state.now_ms + (1000 / 60)
+    clock.sleep(1 / ANALYZER_HZ)
+    state.now_ms = state.now_ms + now_inc_ms
     state.onset_event = false
 
     if state.freeze then
       goto continue
     end
-    
-    -- Check poll health every ~1 second (60 loops / 60 = 1 sec)
+
     poll_check_counter = poll_check_counter + 1
-    if poll_check_counter >= 60 then
+    if poll_check_counter >= ANALYZER_HZ then
       poll_check_counter = 0
       if audio_input then
         audio_input:ensure_healthy({
@@ -696,51 +705,24 @@ local function analyzer_loop()
     update_source_label()
 
     local sample_mode = source_is_sample()
+    local analysis_source_softcut = (params:string("input_mode") == "softcut")
     local amp_raw = 0
-    
-    if sample_mode then
-      -- amp_out_l/r do NOT include softcut on Norns (engine only). Use input as primary
-      -- so that routing output->input (or line-in with the sample) can trigger notes.
-      local amp_in = math.max(state.amp_in_l or 0, state.amp_in_r or 0)
-      local amp_out = math.max(state.amp_out_l or 0, state.amp_out_r or 0)
-      amp_raw = math.max(amp_in, amp_out * 0.7)
-      
-      -- Fallback detection: if all polls are near zero but we have a sample loaded,
-      -- trigger audio service to re-establish monitor routing
-      if amp_raw < 0.0001 and audio_service and state.sample_loaded then
+    local raw_pitch_hz_override = nil
+    local confidence_override = nil
+
+    if analysis_source_softcut then
+      -- Softcut mode: analysis from cut bus (SC engine). Do NOT use ADC.
+      amp_raw = state.amp_sc or 0
+      raw_pitch_hz_override = state.pitch_sc
+      confidence_override = state.pitch_sc_conf
+      if state.sample_loaded and audio_service then
         audio_service:ensure_monitor_routing()
-        if debug_should_log("routing_fallback", 3.0) then
-          debug_log("H15", "notetalk.lua:analyzer_loop", "routing_fallback_triggered", {
-            amp_out_l = state.amp_out_l or -1,
-            amp_out_r = state.amp_out_r or -1,
-            amp_in_l = state.amp_in_l or -1,
-            amp_in_r = state.amp_in_r or -1,
-            sample_loaded = state.sample_loaded
-          })
-        end
       end
     else
-      -- For line-in mode, prioritize input channels
+      -- Audio-in mode: analysis from ADC
       local amp_in = math.max(state.amp_in_l or 0, state.amp_in_r or 0)
       local amp_out = math.max(state.amp_out_l or 0, state.amp_out_r or 0)
-      
-      -- Use input as primary, output as fallback
       amp_raw = math.max(amp_in, amp_out * 0.5)
-    end
-    
-    -- Check poll health every ~1 second (60 loops / 60 = 1 sec)
-    poll_check_counter = poll_check_counter + 1
-    if poll_check_counter >= 60 then
-      poll_check_counter = 0
-      if audio_input then
-        audio_input:ensure_healthy({
-          now_ms = state.now_ms,
-          source_is_sample = source_is_sample,
-          audio_service = audio_service,
-          debug_log = debug_log,
-          debug_should_log = debug_should_log,
-        })
-      end
     end
 
     -- Debug: check if we're getting signal
@@ -757,14 +739,16 @@ local function analyzer_loop()
       })
     end
 
-    -- VU analyzer: normalization (sample mode), amp_norm, amp_for_vu, vu_level; returns amp for display/trigger
+    -- VU: use analysis source amplitude for display when softcut (cut-bus level, not ADC)
+    local amp_for_vu_override = analysis_source_softcut and (state.amp_sc or 0) or nil
     local amp = vu_analyzer and vu_analyzer:update({
       amp_raw = amp_raw,
       sample_mode = sample_mode,
+      amp_for_vu_override = amp_for_vu_override,
     }) or clamp(amp_raw, 0, 1)
 
-    local raw_pitch_hz = state.pitch_hz
-    local confidence = clamp(state.pitch_conf or 0, 0, 1)
+    local raw_pitch_hz = (analysis_source_softcut and raw_pitch_hz_override ~= nil) and raw_pitch_hz_override or state.pitch_hz
+    local confidence = (analysis_source_softcut and confidence_override ~= nil) and clamp(confidence_override, 0, 1) or clamp(state.pitch_conf or 0, 0, 1)
     local min_conf = params:get("min_conf")
 
     -- Pitch service: 100 ms–grid–normalized pitch (sample or live); always in state for combining with onsets
@@ -782,7 +766,7 @@ local function analyzer_loop()
       state.pitch_midi = current_pitch_midi()
     end
 
-    -- Onset service: hit detection only (sample or live); no pitch, combined with pitch service below
+    local debounce_ms = math.max(params:get("hold_ms") or 140, params:get("onset_debounce_ms") or 100)
     local onset_accept, trigger_amp, effective_threshold = OnsetService.detect({
       now_ms = state.now_ms,
       amp_trigger_metric = amp_trigger_metric,
@@ -790,6 +774,7 @@ local function analyzer_loop()
       last_trigger_ms = state.debug_last_trigger_ms,
       threshold = params:get("threshold"),
       hold_ms = params:get("hold_ms"),
+      debounce_ms = debounce_ms,
       sample_mode = sample_mode,
       amp_floor_est = state.amp_floor_est,
       amp_ceil_est = state.amp_ceil_est,
@@ -798,8 +783,15 @@ local function analyzer_loop()
       state.debug_hit_count = state.debug_hit_count + 1
       state.debug_last_trigger_ms = state.now_ms
       state.amp_pulse = math.max(state.amp_pulse, trigger_amp)
+      local timing_offset_ms = params:get("timing_offset_ms") or 0
+      local onset_time_corrected_ms = state.now_ms - timing_offset_ms
       local hz = pitch_service and pitch_service:get_current_hz(state.now_ms) or 220
-      handle_analysis_event({ hz = hz, confidence = 1, amp = trigger_amp })
+      handle_analysis_event({
+        hz = hz,
+        confidence = 1,
+        amp = trigger_amp,
+        onset_time_corrected_ms = onset_time_corrected_ms,
+      })
     end
     if debug_should_log("analyzer_summary", 2.0) then
       -- #region agent log
@@ -838,12 +830,14 @@ end
 
 local function redraw_loop()
   while true do
-    clock.sleep(1 / 15)
+    clock.sleep(1 / 20)  -- 20 fps, spec
     redraw()
   end
 end
 
 function init()
+  -- Notetalk ensin (cut-bus pollit); synth_service kokeilee PolyPerc fallback
+  pcall(function() engine.name = "Notetalk" end)
   if analysis_clock then
     pcall(function() clock.cancel(analysis_clock) end)
     analysis_clock = nil
@@ -898,6 +892,9 @@ function init()
   synth_service:init_engine(function(engine_loaded)
     if engine_loaded then
       state.engine_ready = true
+    end
+    -- Käynnistä analyzer aina jotta VU/grid ja onset-toiminta päivittyvät (nuotit soi kun moottori on)
+    if not analysis_clock then
       analysis_clock = clock.run(analyzer_loop)
     end
     redraw()
@@ -944,10 +941,16 @@ function key(n, z)
     if n == 2 then
       state.freeze = not state.freeze
     elseif n == 3 then
-      if not state.engine_ready then
-        print("notetalk: wait for engine")
-        redraw()
-        return
+      -- K3: pakota äänitie auki, sitten testitoni ja note event
+      if audio_output then
+        audio_output:set_engine_cut_level(1.0)
+      end
+      pcall(function() audio.level_dac(1.0) end)
+      pcall(function() audio.level_cut(1.0) end)
+      pcall(function() audio.level_eng_cut(1.0) end)
+      pcall(function() audio.level_eng(1.0) end)
+      if synth_service then
+        synth_service:play_test_tone()
       end
       local test_event = {
         hz = 440,
