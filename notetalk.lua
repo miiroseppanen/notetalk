@@ -11,9 +11,25 @@ local fileselect = require "fileselect"
 local musicutil = require "musicutil"
 
 -- Käytä midigrid-kirjastoa jos saatavilla (Launchpad jne.) – muuten vakio grid
+-- Kahdelle Launchpadille käytetään midigrid_2pages tai mg_128 (16x8)
 local grid
 do
-  local ok, mg = pcall(function() return include("midigrid/lib/midigrid") end)
+  -- Kokeile ensin 16x8 versiota (kahdelle Launchpadille)
+  local ok, mg = pcall(function() return include("midigrid/lib/midigrid_2pages") end)
+  if not (ok and mg) and _path.code then
+    ok, mg = pcall(function() return include(_path.code .. "midigrid/lib/midigrid_2pages") end)
+  end
+  -- Jos ei löydy, kokeile mg_128
+  if not (ok and mg) then
+    ok, mg = pcall(function() return include("midigrid/lib/mg_128") end)
+  end
+  if not (ok and mg) and _path.code then
+    ok, mg = pcall(function() return include(_path.code .. "midigrid/lib/mg_128") end)
+  end
+  -- Jos ei löydy, käytä tavallista midigrid (8x8)
+  if not (ok and mg) then
+    ok, mg = pcall(function() return include("midigrid/lib/midigrid") end)
+  end
   if not (ok and mg) and _path.code then
     ok, mg = pcall(function() return include(_path.code .. "midigrid/lib/midigrid") end)
   end
@@ -1003,19 +1019,23 @@ end
 
 
 local function setup_grid()
-  g = nil
+  -- Käytä suoraa grid.connect(1) kuten standardi grid-API (midigrid hoitaa automaattisesti)
+  g = grid.connect(1)
   
-  -- Käytä midigridin automaattista tunnistusta (kuten Awake)
-  local ok, conn = pcall(function() return grid.connect() end)
-  if not (ok and conn) then
-    conn = grid.connect(1)
-  end
-  
-  if conn then
-    g = conn
-    -- Käytä gridin raportoimia dimensioita (midigrid hoitaa automaattisesti kaksi Launchpadia)
+  if g then
+    -- Käytä gridin raportoimia dimensioita suoraan (midigrid asettaa ne automaattisesti)
     grid_cols = g.cols or 16
     grid_rows = g.rows or 8
+    
+    -- Jos dimensiot ovat 0 tai puuttuvat, aseta oletukset
+    if grid_cols == 0 or grid_rows == 0 then
+      grid_cols = 16
+      grid_rows = 8
+    end
+    
+    -- Varmista että dimensiot ovat asetettu grid-olioon
+    if g.cols then g.cols = grid_cols end
+    if g.rows then g.rows = grid_rows end
     
     apply_grid_defaults_for_size(grid_cols, grid_rows)
     
