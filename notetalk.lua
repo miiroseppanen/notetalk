@@ -1,6 +1,7 @@
 engine.name = "wordpitch_engine"
 
 local fileselect = require "fileselect"
+local grid = require "grid"
 local musicutil = require "musicutil"
 
 local Analyzer = require "lib.analyzer"
@@ -22,6 +23,9 @@ local state = {
   amp_in = 0,
   pitch_hz = nil,
   pitch_conf = 0,
+  amp_norm = 0,
+  pitch_midi = nil,
+  onset_event = false,
   now_ms = 0,
 }
 
@@ -30,6 +34,18 @@ local pitch_poll = nil
 local conf_poll = nil
 local analysis_clock = nil
 local redraw_clock = nil
+local grid_redraw_metro = nil
+
+local g = nil
+local grid_cols = 0
+local grid_rows = 0
+local last_valid_x = nil
+local onset_x = nil
+local active_line_y = nil
+local active_line_t0 = nil
+local set_active_line_from_event = nil
+
+local LINE_FADE_MS = 500
 
 local SCALE_NAMES = Mapping.get_scale_names()
 
@@ -63,6 +79,61 @@ end
 local function current_scale_name()
   local index = params:get("scale")
   return SCALE_NAMES[index] or "chromatic"
+end
+
+local function current_pitch_midi()
+  if not state.pitch_hz or state.pitch_hz <= 0 then
+    return nil
+  end
+  return Mapping.hz_to_midi(state.pitch_hz)
+end
+
+local function grid_is_ready()
+  return g ~= nil and grid_cols > 0 and grid_rows > 0
+end
+
+local function pitch_to_x(pitch_midi, cols, pitch_min_midi, pitch_max_midi)
+  if pitch_midi == nil or cols < 1 then
+    return nil
+  end
+  if cols == 1 then
+    return 1
+  end
+
+  local min_midi = math.min(pitch_min_midi, pitch_max_midi)
+  local max_midi = math.max(pitch_min_midi, pitch_max_midi)
+  if max_midi == min_midi then
+    return 1
+  end
+
+  local clamped = clamp(pitch_midi, min_midi, max_midi)
+  local norm = (clamped - min_midi) / (max_midi - min_midi)
+  local x = 1 + round(norm * (cols - 1))
+  return clamp(x, 1, cols)
+end
+
+local function amp_to_lit_rows(amp_norm, vu_floor, rows)
+  if rows < 1 then
+    return 0
+  end
+
+  local floor_value = clamp(vu_floor, 0, 0.99)
+  local amp_adj = clamp((clamp(amp_norm or 0, 0, 1) - floor_value) / (1 - floor_value), 0, 1)
+  return clamp(round(amp_adj * rows), 0, rows)
+end
+
+local function threshold_to_y(threshold, vu_floor, rows)
+  if rows < 1 then
+    return 1
+  end
+
+  local floor_value = clamp(vu_floor, 0, 0.99)
+  local thr_adj = clamp((clamp(threshold or 0, 0, 1) - floor_value) / (1 - floor_value), 0, 1)
+  local thr_lit = clamp(round(thr_adj * rows), 0, rows)
+  if thr_lit == 0 then
+    return rows
+  end
+  return clamp(rows - thr_lit + 1, 1, rows)
 end
 
 local function source_is_sample()
@@ -171,6 +242,9 @@ local function trigger_synth(note, amp)
 end
 
 local function handle_analysis_event(event)
+  state.onset_event = true
+  set_active_line_from_event(event)
+
   local note = midi_note_from_event(event)
   if not note then
     return
@@ -316,6 +390,31 @@ local function add_synth_and_fx_params()
   params:set_action("fx_delay_send", function() apply_engine_settings() end)
 end
 
+local function add_grid_visualizer_params()
+  params:add_separator("grid_viz_sep", "Grid Visualizer")
+  params:add_control("vu_floor", "VU Floor", controlspec.new(0, 0.5, "lin", 0, 0.08, ""))
+  params:add_number("pitch_min_midi", "Pitch Min MIDI", 0, 127, 36)
+  params:add_number("pitch_max_midi", "Pitch Max MIDI", 0, 127, 96)
+  params:add_option("vu_mode", "VU Mode", {"column", "wide"}, 2)
+  params:add_option("line_mode", "Line Mode", {"threshold", "onset"}, 1)
+end
+
+local function apply_grid_defaults_for_size(cols, rows)
+  if cols <= 0 or rows <= 0 then
+    return
+  end
+
+  if cols <= 8 and rows <= 8 then
+    params:set("vu_mode", option_index({"column", "wide"}, "column"))
+    params:set("pitch_min_midi", 48)
+    params:set("pitch_max_midi", 84)
+  else
+    params:set("vu_mode", option_index({"column", "wide"}, "wide"))
+    params:set("pitch_min_midi", 36)
+    params:set("pitch_max_midi", 96)
+  end
+end
+
 local function setup_params()
   params:add_separator("script_sep", "notetalk")
   add_input_params()
@@ -323,13 +422,165 @@ local function setup_params()
   add_mapping_params()
   add_midi_params()
   add_synth_and_fx_params()
+  add_grid_visualizer_params()
   params:bang()
+end
+
+local function update_grid_dimensions()
+  if g then
+    grid_cols = g.cols or 0
+    grid_rows = g.rows or 0
+  else
+    grid_cols = 0
+    grid_rows = 0
+  end
+end
+
+set_active_line_from_event = function(event)
+  if not grid_is_ready() then
+    return
+  end
+
+  local min_conf = params:get("min_conf")
+  local conf = clamp(event.confidence or 0, 0, 1)
+  if conf < min_conf then
+    return
+  end
+
+  local pitch_midi = Mapping.hz_to_midi(event.hz)
+  local pitch_min = params:get("pitch_min_midi")
+  local pitch_max = params:get("pitch_max_midi")
+  onset_x = pitch_to_x(pitch_midi, grid_cols, pitch_min, pitch_max)
+
+  local selected_line_mode = params:string("line_mode")
+  local y = grid_rows
+  if selected_line_mode == "onset" then
+    local onset_lit = amp_to_lit_rows(event.amp or 0, params:get("vu_floor"), grid_rows)
+    if onset_lit == 0 then
+      y = grid_rows
+    else
+      y = clamp(grid_rows - onset_lit + 1, 1, grid_rows)
+    end
+  else
+    y = threshold_to_y(params:get("threshold"), params:get("vu_floor"), grid_rows)
+  end
+
+  active_line_y = y
+  active_line_t0 = util.time()
+end
+
+local function grid_redraw()
+  update_grid_dimensions()
+  if not grid_is_ready() then
+    return
+  end
+
+  g:all(0)
+
+  local amp_norm = clamp(state.amp_norm or 0, 0, 1)
+  local pitch_midi = state.pitch_midi
+  local pitch_conf = clamp(state.pitch_conf or 0, 0, 1)
+  local min_conf = params:get("min_conf")
+  local pitch_min = params:get("pitch_min_midi")
+  local pitch_max = params:get("pitch_max_midi")
+  local vu_floor = params:get("vu_floor")
+
+  local current_x = nil
+  if pitch_midi and pitch_conf >= min_conf then
+    current_x = pitch_to_x(pitch_midi, grid_cols, pitch_min, pitch_max)
+    last_valid_x = current_x
+  elseif last_valid_x then
+    current_x = last_valid_x
+  else
+    current_x = math.ceil(grid_cols / 2)
+  end
+  current_x = clamp(current_x, 1, grid_cols)
+
+  local lit = amp_to_lit_rows(amp_norm, vu_floor, grid_rows)
+  local vu_mode = params:string("vu_mode")
+
+  if lit > 0 then
+    if vu_mode == "wide" then
+      for x = 1, grid_cols do
+        for i = 0, lit - 1 do
+          local y = grid_rows - i
+          g:led(x, y, 3)
+        end
+      end
+    end
+
+    for i = 0, lit - 1 do
+      local y = grid_rows - i
+      g:led(current_x, y, 10)
+    end
+  end
+
+  if active_line_y and active_line_t0 then
+    local age_ms = (util.time() - active_line_t0) * 1000
+    if age_ms < LINE_FADE_MS then
+      local line_brightness = round(15 * (1 - (age_ms / LINE_FADE_MS)))
+      line_brightness = clamp(line_brightness, 0, 15)
+      if line_brightness > 0 then
+        for x = 1, grid_cols do
+          g:led(x, active_line_y, line_brightness)
+        end
+      end
+    else
+      active_line_y = nil
+      active_line_t0 = nil
+    end
+  end
+
+  g:refresh()
+end
+
+local function setup_grid()
+  g = grid.connect()
+  update_grid_dimensions()
+  if grid_is_ready() then
+    apply_grid_defaults_for_size(grid_cols, grid_rows)
+  end
+
+  if g then
+    g.key = function(_, _, _) end
+  end
+
+  grid.add = function()
+    g = grid.connect()
+    update_grid_dimensions()
+    if grid_is_ready() then
+      apply_grid_defaults_for_size(grid_cols, grid_rows)
+      last_valid_x = nil
+      onset_x = nil
+      active_line_y = nil
+      active_line_t0 = nil
+    end
+  end
+
+  grid.remove = function()
+    update_grid_dimensions()
+    if not grid_is_ready() then
+      g = nil
+      grid_cols = 0
+      grid_rows = 0
+      last_valid_x = nil
+      onset_x = nil
+      active_line_y = nil
+      active_line_t0 = nil
+    end
+  end
+
+  grid_redraw_metro = metro.init()
+  grid_redraw_metro.time = 1 / 30
+  grid_redraw_metro.event = grid_redraw
+  grid_redraw_metro:start()
 end
 
 local function analyzer_loop()
   while true do
     clock.sleep(1 / 60)
     state.now_ms = state.now_ms + (1000 / 60)
+    state.onset_event = false
 
     if state.freeze then
       goto continue
@@ -340,6 +591,8 @@ local function analyzer_loop()
     local amp = clamp(state.amp_in or 0, 0, 1)
     local pitch = state.pitch_hz
     local confidence = clamp(state.pitch_conf or 0, 0, 1)
+    state.amp_norm = amp
+    state.pitch_midi = current_pitch_midi()
     local event = analyzer:process_observation(amp, pitch, confidence, state.now_ms)
 
     if event then
@@ -369,6 +622,7 @@ function init()
   setup_softcut_defaults()
   setup_params()
   setup_polls()
+  setup_grid()
   update_source_label()
   apply_engine_settings()
 
@@ -440,6 +694,7 @@ end
 
 function cleanup()
   cleanup_polls()
+  if grid_redraw_metro then grid_redraw_metro:stop() end
   if analysis_clock then clock.cancel(analysis_clock) end
   if redraw_clock then clock.cancel(redraw_clock) end
 end

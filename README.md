@@ -69,6 +69,37 @@ Main screen controls:
 
 The script UI and parameter labels are fully in English and follow standard Norns control conventions.
 
+## Grid Visualizer
+
+`notetalk` includes a size-agnostic Monome Grid visualizer that works with 8x8, 16x8, and 16x16 layouts without hardcoded dimensions.
+
+- `Y axis`: VU from bottom to top
+- `X axis`: pitch position
+- On onset trigger, a horizontal line is drawn across the full grid width and fades out linearly over `500 ms`
+- Visualizer uses existing analysis outputs (`amp_norm`, `pitch_midi`, `pitch_conf`, threshold/confidence) and does not change onset or pitch calculations
+
+### Grid Parameters
+
+- `VU Floor`
+- `Pitch Min MIDI`
+- `Pitch Max MIDI`
+- `VU Mode`: `column` or `wide`
+- `Line Mode`: `threshold` or `onset`
+
+Default behavior at connect time:
+
+- 8x8: defaults to `column` and narrower pitch range
+- 16x8 / 16x16: defaults to `wide` and wider pitch range
+
+In `wide` mode:
+
+- a dim background VU fills all columns
+- the current pitch column is highlighted brighter
+
+In `column` mode:
+
+- only the current pitch column is shown
+
 ## Files
 
 - `notetalk.lua`: main script, params, UI, loop logic
@@ -80,3 +111,4 @@ The script UI and parameter labels are fully in English and follow standard Norn
 
 - Pitch/confidence polls (`pitch_in`, `pitch_conf`) are used when available.
 - If your engine does not expose these polls, manual trigger (`K3`) and MIDI/synth routing still work, but automatic pitch-trigger behavior depends on available pitch data.
+- Grid drawing runs in its own refresh loop (about 30 FPS) and overlays the trigger line above VU LEDs.
