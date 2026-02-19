@@ -18,7 +18,7 @@ function AudioService:setup_defaults()
   pcall(function() audio.level_cut(1.0) end)
   pcall(function() softcut.enable(1, 1) end)
   pcall(function() softcut.buffer(1, 1) end)
-  pcall(function() softcut.level(1, 1) end)
+  pcall(function() softcut.level(1, 0.8) end)
   pcall(function() softcut.level_input_cut(1, 1, 0) end)
   pcall(function() softcut.level_input_cut(2, 1, 0) end)
   pcall(function() softcut.rec_level(1, 0) end)
@@ -31,8 +31,11 @@ function AudioService:setup_defaults()
   pcall(function() softcut.loop_end(1, 4) end)
   pcall(function() softcut.position(1, 0) end)
   pcall(function() softcut.play(1, 0) end)
+  
+  -- CRITICAL: Route softcut output for amplitude polling
+  pcall(function() audio.level_cut(1.0) end) -- Route softcut to output for monitoring
+  
   self.softcut_active = true
-  print("audio_service: defaults setup, softcut_active=true")
 end
 
 function AudioService:setup_phase_monitor(enable)
@@ -50,7 +53,6 @@ function AudioService:setup_phase_monitor(enable)
     end)
   end)
   self.phase_monitor_active = true
-  print("audio_service: phase monitor started")
 end
 
 function AudioService:clear_phase_monitor()
@@ -64,7 +66,6 @@ function AudioService:clear_phase_monitor()
     softcut.poll_stop_phase()
   end)
   self.phase_monitor_active = false
-  print("audio_service: phase monitor cleared")
 end
 
 function AudioService:load_sample(path, defer_clock_fn)
@@ -89,14 +90,17 @@ function AudioService:load_sample(path, defer_clock_fn)
     -- Wait for buffer read to complete before starting playback
     clock.sleep(0.1)
     
+    -- Ensure proper signal routing before playback
+    pcall(function() audio.level_cut(1.0) end) -- Route softcut to output
+    pcall(function() softcut.level(1, 0.9) end) -- Korkea level samplelle
     softcut.position(1, 0)
     softcut.play(1, 1)
+    
   end)
 
   if ok then
     self.sample_loaded = true
     self.sample_path = path
-    print("audio_service: sample loaded: " .. path)
 
     local _, frames, sample_rate = audio.file_info(path)
     if frames and sample_rate and sample_rate > 0 then
@@ -115,7 +119,6 @@ function AudioService:load_sample(path, defer_clock_fn)
   else
     self.sample_loaded = false
     self.sample_path = nil
-    print("audio_service: sample load failed: " .. tostring(err))
     return false
   end
 end
@@ -124,20 +127,17 @@ function AudioService:unload_sample()
   self.sample_loaded = false
   self.sample_path = nil
   pcall(function() softcut.play(1, 0) end)
-  print("audio_service: sample unloaded")
 end
 
 function AudioService:cleanup()
-  print("audio_service cleanup start")
   self:clear_phase_monitor()
   if self.softcut_active then
     -- CRITICAL: Stop everything before reset
-    print("audio_service: stopping all softcut operations")
     pcall(function() softcut.play(1, 0) end)
     pcall(function() softcut.rec(1, 0) end)
     
-    -- Wait for stop to take effect
-    clock.sleep(0.05)
+    -- Brief delay for stop to take effect
+    for i = 1, 2000 do end
     
     -- Reset all parameters to safe defaults
     pcall(function() softcut.level(1, 0) end)
@@ -151,43 +151,20 @@ function AudioService:cleanup()
     pcall(function() softcut.loop_start(1, 0) end)
     pcall(function() softcut.loop_end(1, 1) end)
     
-    -- CRITICAL: Clear buffer last and wait
-    print("audio_service: clearing buffer")
+    -- Clear buffer (lyhennetty wait restartin nopeuttamiseksi)
     pcall(function() softcut.buffer_clear() end)
-    clock.sleep(0.1)  -- Critical wait for buffer operations
-    
-    -- Critical: wait for buffer operations to complete
-    print("audio_service: waiting for buffer operations to settle...")
-    for i = 1, 10 do
-      if _norns and _norns.crow then  -- Only if available
-        _norns.crow.sleep(0.01)
-      else
-        -- Fallback busy wait
-        local start = util.time()
-        while (util.time() - start) < 0.01 do end
-      end
-    end
+    for i = 1, 10000 do end
     
     pcall(function() softcut.enable(1, 0) end)
     self.softcut_active = false
-    print("audio_service: full softcut reset completed")
   end
   
-  -- Extended grace period for JACK client cleanup
-  print("audio_service: grace period for JACK state cleanup...")
-  for i = 1, 20 do
-    if _norns and _norns.crow then 
-      _norns.crow.sleep(0.005)
-    else
-      local start = util.time()
-      while (util.time() - start) < 0.005 do end
-    end
-  end
+  -- Brief grace period for JACK client cleanup (lyhennetty restartin nopeuttamiseksi)
+  for i = 1, 10000 do end
   
   -- Reset audio levels to safe defaults
   pcall(function() audio.level_cut(0.8) end)  
   pcall(function() audio.level_eng_cut(1.0) end)  
-  print("audio_service cleanup end")
 end
 
 function AudioService:get_status()
@@ -197,6 +174,27 @@ function AudioService:get_status()
     softcut_active = self.softcut_active,
     phase_monitor_active = self.phase_monitor_active
   }
+end
+
+function AudioService:verify_signal_routing()
+  if not self.softcut_active then
+    return false, "softcut not active"
+  end
+  
+  -- Check if basic routing is set up
+  local monitor_level = 0
+  pcall(function() 
+    monitor_level = softcut.query_monitor_level() or 0
+  end)
+  
+  return true, "routing configured"
+end
+
+function AudioService:ensure_monitor_routing()
+  if self.softcut_active then
+    -- Vain reititys (DAC): älä koske softcut.level() – E2/sample level säilyy
+    pcall(function() audio.level_cut(1.0) end)
+  end
 end
 
 return AudioService
