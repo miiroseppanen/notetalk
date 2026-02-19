@@ -68,6 +68,7 @@ local state = {
   phase_pulse_t = 0,
   amp_poll_restart_warned = false,
   vu_level = 0,  -- VU-mittarille: hitaasti decaytaava taso
+  vu_test_mode = true,  -- Testi-VU-animaatio päällä (vaihdetaan parametrista)
 }
 
 local amp_poll = nil
@@ -840,6 +841,10 @@ local function add_grid_visualizer_params()
   params:add_number("pitch_max_midi", "Pitch Max MIDI", 0, 127, 96)
   params:add_option("vu_mode", "VU Mode", {"column", "wide"}, 2)
   params:add_option("line_mode", "Line Mode", {"threshold", "onset"}, 1)
+  params:add_option("vu_test_mode", "VU Test Animation", {"off", "on"}, 2)  -- Oletuksena päällä
+  params:set_action("vu_test_mode", function(value)
+    state.vu_test_mode = (value == 2)
+  end)
 end
 
 local function apply_grid_defaults_for_size(cols, rows)
@@ -917,24 +922,26 @@ local function draw_grid()
       vu_mode = params:string("vu_mode") or vu_mode
     end)
     
-    -- VU-mittari: käytä suoraan poll-arvoja tai vu_level
-    local sample_mode = source_is_sample()
-    local direct_amp = 0
-    if sample_mode then
-      direct_amp = math.max(state.amp_out_l or 0, state.amp_out_r or 0)
+    -- TESTI-VU: animoi siniaaltoa jos testi-tila päällä
+    local vu_amp = 0
+    if state.vu_test_mode then
+      -- Siniaalto-animaatio: 0.2-0.9 välillä, ~2 sekunnin jakso
+      local t = util.time()
+      vu_amp = 0.2 + (math.sin(t * math.pi) * 0.35 + 0.35)  -- 0.2-0.9
     else
-      direct_amp = math.max(state.amp_in_l or 0, state.amp_in_r or 0)
-    end
-    
-    -- Käytä vu_level:ia jos se on suurempi, muuten käytä suoraa poll-arvoa vahvistettuna
-    local vu_from_level = clamp(state.vu_level or 0, 0, 1)
-    local vu_from_polls = math.min(1, direct_amp * 50)  -- Erittäin vahva vahvistus
-    local vu_amp = math.max(vu_from_level, vu_from_polls)
-    
-    -- TESTI: jos kaikki on 0, näytä silti pieni VU testinä
-    if vu_amp < 0.01 and (state.amp_out_l or 0) + (state.amp_out_r or 0) + (state.amp_in_l or 0) + (state.amp_in_r or 0) == 0 then
-      -- Jos ei signaalia ollenkaan, näytä silti pieni testi-VU (1 rivi) jotta nähdään että grid toimii
-      vu_amp = 0.1  -- Testi: näytä 1 rivi
+      -- Oikea VU: käytä suoraan poll-arvoja tai vu_level
+      local sample_mode = source_is_sample()
+      local direct_amp = 0
+      if sample_mode then
+        direct_amp = math.max(state.amp_out_l or 0, state.amp_out_r or 0)
+      else
+        direct_amp = math.max(state.amp_in_l or 0, state.amp_in_r or 0)
+      end
+      
+      -- Käytä vu_level:ia jos se on suurempi, muuten käytä suoraa poll-arvoa vahvistettuna
+      local vu_from_level = clamp(state.vu_level or 0, 0, 1)
+      local vu_from_polls = math.min(1, direct_amp * 50)  -- Erittäin vahva vahvistus
+      vu_amp = math.max(vu_from_level, vu_from_polls)
     end
     
     local lit_rows = 0
@@ -1351,6 +1358,8 @@ function init()
 
   audio_service:setup_defaults()
   setup_params()
+  -- Aseta testi-tila parametrin mukaan
+  state.vu_test_mode = (params:get("vu_test_mode") == 2)
   setup_polls()
   setup_grid()
   
