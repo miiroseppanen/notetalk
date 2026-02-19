@@ -14,6 +14,9 @@ local musicutil = require "musicutil"
 local grid
 do
   local ok, mg = pcall(function() return include("midigrid/lib/midigrid") end)
+  if not (ok and mg) and _path.code then
+    ok, mg = pcall(function() return include(_path.code .. "midigrid/lib/midigrid") end)
+  end
   if ok and mg then
     grid = mg
   else
@@ -899,34 +902,65 @@ end
 local function draw_grid()
   if not g then return end
   
-  pcall(function()
+  local cols = grid_cols or g.cols or 16
+  local rows = grid_rows or g.rows or 8
+  if cols < 1 or rows < 1 then return end
+  
+  local ok, err = pcall(function()
     g:all(0)
     
-    local cols = grid_cols or g.cols or 16
-    local rows = grid_rows or g.rows or 8
-    
-    -- VU-mittari: käytä hitaasti decaytaavaa tasoa (pysyy näkyvänä pidempään)
-    local vu_amp = clamp(state.vu_level or 0, 0, 1)
+    -- Turvallinen param-luku (draw_grid voi kutsua ennen params:bang())
     local vu_floor = 0.02
+    local vu_mode = "wide"
+    pcall(function()
+      vu_floor = params:get("vu_floor") or vu_floor
+      vu_mode = params:string("vu_mode") or vu_mode
+    end)
     
-    if vu_amp > vu_floor then
-      local vu_range = clamp((vu_amp - vu_floor) / (1 - vu_floor), 0, 1)
-      local lit_rows = math.max(1, round(vu_range * rows))
-      local center_x = math.ceil(cols / 2)
-      
-      -- VU-viivat alhaalta ylös
-      for i = 0, lit_rows - 1 do
-        local y = rows - i
-        if y >= 1 and y <= rows then
-          -- Kirkkaampi ylhäällä, himmeämpi alhaalla
-          local brightness = clamp(4 + round(11 * (i / math.max(1, lit_rows - 1))), 4, 15)
-          g:led(center_x, y, brightness)
+    -- VU-mittari: käytä hitaasti decaytaavaa tasoa
+    local vu_amp = clamp(state.vu_level or 0, 0, 1)
+    local lit_rows = 0
+    
+    if vu_amp > vu_floor * 0.5 then
+      local vu_range = clamp((vu_amp - vu_floor * 0.5) / (1 - vu_floor * 0.5), 0, 1)
+      lit_rows = math.max(1, round(vu_range * rows))
+    end
+    
+    -- Aina näkyvä: joko VU-taso tai yksi himmeä rivi alhaalla (yhteys-indikaattori)
+    if lit_rows > 0 then
+      if vu_mode == "wide" then
+        for x = 1, cols do
+          for i = 0, lit_rows - 1 do
+            local y = rows - i
+            if y >= 1 and y <= rows then
+              local brightness = clamp(4 + round(11 * (i / math.max(1, lit_rows - 1))), 4, 15)
+              g:led(x, y, brightness)
+            end
+          end
         end
+      else
+        local center_x = math.ceil(cols / 2)
+        for i = 0, lit_rows - 1 do
+          local y = rows - i
+          if y >= 1 and y <= rows then
+            local brightness = clamp(4 + round(11 * (i / math.max(1, lit_rows - 1))), 4, 15)
+            g:led(center_x, y, brightness)
+          end
+        end
+      end
+    else
+      -- Ei signaalia: yksi himmeä rivi alhaalla (grid elää)
+      local y_bottom = rows
+      for x = 1, cols do
+        g:led(x, y_bottom, 1)
       end
     end
     
     g:refresh()
   end)
+  if not ok and err then
+    -- Virhe piirrossa – älä kaada, mutta voisi logata
+  end
 end
 
 set_active_line_from_event = function(event)
@@ -936,32 +970,45 @@ end
 
 
 local function setup_grid()
-  g = grid.connect(1)
+  g = nil
+  do
+    local ok, conn = pcall(function() return grid.connect() end)
+    if ok and conn then
+      g = conn
+    end
+    if not g then
+      g = grid.connect(1)
+    end
+  end
   
   if g then
-    -- Jos dimensiot puuttuvat, pakota 16x8 (midigrid oletus)
-    if (g.cols == 0 or g.rows == 0) then
-      g.cols = 16
-      g.rows = 8
-    end
+    grid_cols = (g.cols and g.cols > 0) and g.cols or 16
+    grid_rows = (g.rows and g.rows > 0) and g.rows or 8
     
-    -- Käytä todellisia dimensioita (tukee 16x8 = 128 gridiä)
-    grid_cols = g.cols
-    grid_rows = g.rows
+    if g.cols then g.cols = grid_cols end
+    if g.rows then g.rows = grid_rows end
     
-    -- Set key handler
+    apply_grid_defaults_for_size(grid_cols, grid_rows)
+    
     g.key = function(x, y, z) end
     
-    -- Piirrä heti
     draw_grid()
     
-    -- Aloita redraw metro (täsmälleen sama kuin grid_test.lua)
-    grid_redraw_metro = metro.init()
-    grid_redraw_metro.time = 1.0
-    grid_redraw_metro.event = function()
-      draw_grid()
+    if grid_redraw_metro then
+      pcall(function() grid_redraw_metro:stop() end)
+      grid_redraw_metro = nil
     end
-    grid_redraw_metro:start()
+    grid_redraw_metro = metro.init()
+    if grid_redraw_metro then
+      grid_redraw_metro.time = 1 / 30
+      grid_redraw_metro.event = function() draw_grid() end
+      grid_redraw_metro:start()
+    end
+    
+    -- Kun grid liitetään myöhemmin, päivitä
+    grid.add = function()
+      setup_grid()
+    end
   end
 end
 
@@ -1118,8 +1165,9 @@ local function analyzer_loop()
     state.pitch_midi = current_pitch_midi()
     
     -- VU: käytä samaa signaalia kuin amp_raw (sample = ulostulo, line-in = sisääntulo), decay hitaampi
-    local instant = math.max(state.amp_norm or 0, math.min(1, amp_raw * 4))
-    state.vu_level = math.max(instant, (state.vu_level or 0) * 0.996)
+    -- Käytä sekä normalisoitua että raakaa signaalia paremman responsiivisuuden vuoksi
+    local instant = math.max(state.amp_norm or 0, math.min(1, amp_raw * 3))
+    state.vu_level = math.max(instant, (state.vu_level or 0) * 0.995)
 
     -- Sample-mode trigger from transients, not fixed clock.
     local threshold = params:get("threshold")
