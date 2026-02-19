@@ -4,8 +4,8 @@
 -- v1.0.0 @2026
 --  
 
--- Engine change can corrupt JACK state - use default engine instead
--- engine.name = "PolyPerc"
+-- Engine: set in deferred init so script has sound on shields with no default engine.
+-- (Setting at load time can corrupt JACK on some systems.)
 
 local fileselect = require "fileselect"
 local musicutil = require "musicutil"
@@ -43,13 +43,16 @@ end
 local Analyzer = include("lib/analyzer")
 local Mapping = include("lib/mapping")
 local MidiOut = include("lib/midi_out")
--- Grid service replaced with direct grid handling
 local AudioService = include("lib/audio_service")
+local GridVisualizer = include("lib/grid_visualizer")
+local PitchService = include("lib/pitch_service")
+local OnsetService = include("lib/onset_service")
 
 local analyzer
 local midi_out
-local grid_redraw_metro = nil
+local grid_visualizer = nil
 local audio_service
+local pitch_service
 
 local state = {
   freeze = false,
@@ -83,8 +86,10 @@ local state = {
   phase_last_pos = nil,
   phase_pulse_t = 0,
   amp_poll_restart_warned = false,
-  vu_level = 0,  -- VU-mittarille: hitaasti decaytaava taso
-  vu_test_mode = true,  -- Testi-VU-animaatio päällä (vaihdetaan parametrista)
+  vu_level = 0,  -- VU-mittarille: hitaasti decaytaava taso (ulos/sisääntulo)
+  vu_test_mode = false,  -- Oletuksena pois: grid näyttää oikean äänen tason
+  grid_col_amp = {},   -- per-sarake: kohdetaso (decay)
+  grid_col_display = {}, -- per-sarake: näytetty taso (smooth rise)
 }
 
 local amp_poll = nil
@@ -100,6 +105,7 @@ local redraw_clock = nil
 local g = nil
 local grid_cols = 0
 local grid_rows = 0
+-- g/grid_cols/grid_rows synkataan grid_visualizerista setupin jälkeen
 local last_valid_x = nil
 local last_grid_debug = 0
 local onset_x = nil
@@ -113,8 +119,6 @@ local DEBUG_RUN_ID = "grid-note-plan-v1"
 
 local SCALE_NAMES = Mapping.get_scale_names()
 local debug_last_log_at = {}
-local voiced_pitch_samples = {}
-local VOICED_PITCH_CAP = 9
 local GRID_RECOVER_TICKS = 120
 local grid_not_ready_ticks = 0
 local deferred_clocks = {}
@@ -195,25 +199,6 @@ local function median_numbers(values)
     return sorted[center + 1]
   end
   return (sorted[center] + sorted[center + 1]) * 0.5
-end
-
-local function push_voiced_pitch(hz, now_ms)
-  if not hz or hz <= 0 then
-    return
-  end
-  voiced_pitch_samples[#voiced_pitch_samples + 1] = hz
-  if #voiced_pitch_samples > VOICED_PITCH_CAP then
-    table.remove(voiced_pitch_samples, 1)
-  end
-  state.voiced_pitch_last_ms = now_ms or state.now_ms
-end
-
-local function recent_voiced_pitch(now_ms, max_age_ms)
-  local age_limit = max_age_ms or 700
-  if (#voiced_pitch_samples == 0) or ((now_ms - (state.voiced_pitch_last_ms or -10000)) > age_limit) then
-    return nil
-  end
-  return median_numbers(voiced_pitch_samples)
 end
 
 local function option_index(options, target)
@@ -298,51 +283,10 @@ local function current_pitch_midi()
 end
 
 local function grid_is_ready()
+  if grid_visualizer then
+    return grid_visualizer:is_ready()
+  end
   return g ~= nil and grid_cols > 0 and grid_rows > 0
-end
-
-local function pitch_to_x(pitch_midi, cols, pitch_min_midi, pitch_max_midi)
-  if pitch_midi == nil or cols < 1 then
-    return nil
-  end
-  if cols == 1 then
-    return 1
-  end
-
-  local min_midi = math.min(pitch_min_midi, pitch_max_midi)
-  local max_midi = math.max(pitch_min_midi, pitch_max_midi)
-  if max_midi == min_midi then
-    return 1
-  end
-
-  local clamped = clamp(pitch_midi, min_midi, max_midi)
-  local norm = (clamped - min_midi) / (max_midi - min_midi)
-  local x = 1 + round(norm * (cols - 1))
-  return clamp(x, 1, cols)
-end
-
-local function amp_to_lit_rows(amp_norm, vu_floor, rows)
-  if rows < 1 then
-    return 0
-  end
-
-  local floor_value = clamp(vu_floor, 0, 0.99)
-  local amp_adj = clamp((clamp(amp_norm or 0, 0, 1) - floor_value) / (1 - floor_value), 0, 1)
-  return clamp(round(amp_adj * rows), 0, rows)
-end
-
-local function threshold_to_y(threshold, vu_floor, rows)
-  if rows < 1 then
-    return 1
-  end
-
-  local floor_value = clamp(vu_floor, 0, 0.99)
-  local thr_adj = clamp((clamp(threshold or 0, 0, 1) - floor_value) / (1 - floor_value), 0, 1)
-  local thr_lit = clamp(round(thr_adj * rows), 0, rows)
-  if thr_lit == 0 then
-    return rows
-  end
-  return clamp(rows - thr_lit + 1, 1, rows)
 end
 
 local function update_source_label()
@@ -362,10 +306,30 @@ local function apply_engine_settings()
   local target_level = synth_on and synth_level or 0
   pcall(function() audio.level_eng_cut(target_level) end)
 
-  pcall(function() engine.level(target_level) end)
-  pcall(function() engine.amp(target_level) end)
-  pcall(function() engine.reverb_send(reverb_send) end)
-  pcall(function() engine.delay_send(delay_send) end)
+  -- Only call engine commands if they exist
+  if pcall(function() return engine.level ~= nil end) then
+    pcall(function() engine.level(target_level) end)
+  end
+  if pcall(function() return engine.amp ~= nil end) then
+    pcall(function() engine.amp(target_level) end)
+  end
+  if pcall(function() return engine.reverb_send ~= nil end) then
+    pcall(function() engine.reverb_send(reverb_send) end)
+  end
+  if pcall(function() return engine.delay_send ~= nil end) then
+    pcall(function() engine.delay_send(delay_send) end)
+  end
+end
+
+-- Normalize sample path to full path (works when fileselect or device returns different formats)
+local function normalize_sample_path(path)
+  if not path or path == "" then return path end
+  path = path:gsub("^%s+", ""):gsub("%s+$", "")
+  if path:sub(1, 1) == "/" then
+    return path
+  end
+  local base = _path.audio and (_path.audio:gsub("/$", "")) or "/home/we/dust/audio"
+  return base .. "/" .. path:gsub("^/", "")
 end
 
 -- Moved to AudioService
@@ -374,6 +338,7 @@ local function load_sample(path, attempt)
   if not path or path == "" then
     return
   end
+  path = normalize_sample_path(path)
   attempt = attempt or 1
   local success = audio_service:load_sample(path, defer_clock)
   
@@ -399,15 +364,60 @@ local function load_sample(path, attempt)
 end
 
 local function play_boot_test_tone()
-  defer_clock(function()
-    clock.sleep(0.3)
-    if state.freeze then return end
-    pcall(function() engine.hz(440) end)
-    pcall(function() engine.amp(0.35) end)
-    clock.sleep(0.2)
-    if state.freeze then return end
-    pcall(function() engine.amp(0) end)
-  end)
+  if state.freeze then return end
+  
+  -- Don't check engine.x ~= nil (norns engine can expose commands differently by context).
+  -- Just try each method with pcall and use whichever works.
+  local sound_played = false
+  
+  -- Method 1: noteOn/noteOff (PolyPerc)
+  local ok_note = pcall(function() engine.noteOn(0.35) end)
+  if ok_note then
+    print("notetalk: boot tone started via noteOn")
+    defer_clock(function()
+      clock.sleep(0.2)
+      if state.freeze then return end
+      pcall(function() engine.noteOff() end)
+      print("notetalk: boot tone ended")
+    end)
+    sound_played = true
+  end
+  
+  -- Method 2: hz + amp
+  if not sound_played then
+    local ok_hz = pcall(function() engine.hz(440) end)
+    local ok_amp = pcall(function() engine.amp(0.35) end)
+    if ok_hz and ok_amp then
+      print("notetalk: boot tone started (hz/amp)")
+      defer_clock(function()
+        clock.sleep(0.2)
+        if state.freeze then return end
+        pcall(function() engine.amp(0) end)
+        print("notetalk: boot tone ended")
+      end)
+      sound_played = true
+    end
+  end
+  
+  -- Method 3: freq + level
+  if not sound_played then
+    local ok_freq = pcall(function() engine.freq(440) end)
+    local ok_level = pcall(function() engine.level(0.35) end)
+    if ok_freq and ok_level then
+      print("notetalk: boot tone started (freq/level)")
+      defer_clock(function()
+        clock.sleep(0.2)
+        if state.freeze then return end
+        pcall(function() engine.level(0) end)
+        print("notetalk: boot tone ended")
+      end)
+      sound_played = true
+    end
+  end
+  
+  if not sound_played then
+    print("notetalk: WARNING - boot tone failed (all methods threw)")
+  end
 end
 
 setup_softcut_phase_monitor = function()
@@ -480,7 +490,7 @@ local function midi_note_from_event(event)
 end
 
 local function stabilized_event_hz(event_hz, now_ms)
-  local hz = recent_voiced_pitch(now_ms, 700) or event_hz
+  local hz = (pitch_service and pitch_service:recent_voiced(now_ms, 700)) or event_hz
   if not hz or hz <= 0 then
     return nil
   end
@@ -508,9 +518,10 @@ local function trigger_synth(note, amp)
   end
 
   local hz = musicutil.note_num_to_freq(note)
-  local level = clamp(amp or 0.2, 0, 1)
-  -- Keep triggers audible even when analysis amp is near threshold.
-  level = clamp((0.15 + (level * 0.85)) * params:get("synth_level"), 0, 1)
+  local amp_norm = clamp(amp or 0.2, 0, 1)
+  -- Higher floor and scale so notes are clearly audible (0.5–1.0 range before synth_level).
+  local level = clamp(0.5 + (amp_norm * 0.5), 0, 1) * params:get("synth_level")
+  level = clamp(level, 0, 1)
 
   pcall(function() engine.hz(hz) end)
 
@@ -769,12 +780,12 @@ end
 
 local function add_analysis_params()
   params:add_separator("analysis_sep", "Analysis")
-  params:add_control("threshold", "Threshold", controlspec.new(0.001, 1, "lin", 0, 0.05, ""))
+  params:add_control("threshold", "Threshold", controlspec.new(0.001, 1, "lin", 0, 0.02, ""))
   params:set_action("threshold", function(value)
     analyzer:set_threshold(value)
   end)
 
-  params:add_control("min_conf", "Min Confidence", controlspec.new(0, 1, "lin", 0, 0.45, ""))
+  params:add_control("min_conf", "Min Confidence", controlspec.new(0, 1, "lin", 0, 0.35, ""))
   params:set_action("min_conf", function(value)
     analyzer:set_min_conf(value)
   end)
@@ -840,7 +851,7 @@ local function add_synth_and_fx_params()
   params:add_option("use_synth", "Use Synth", {"off", "on"}, 2)
   params:set_action("use_synth", function() apply_engine_settings() end)
 
-  params:add_control("synth_level", "Synth Level", controlspec.new(0, 1, "lin", 0, 0.6, ""))
+  params:add_control("synth_level", "Synth Level", controlspec.new(0, 1, "lin", 0, 0.8, ""))
   params:set_action("synth_level", function() apply_engine_settings() end)
 
   params:add_control("fx_reverb_send", "FX Reverb Send", controlspec.new(0, 1, "lin", 0, 0.2, ""))
@@ -850,35 +861,6 @@ local function add_synth_and_fx_params()
   params:set_action("fx_delay_send", function() apply_engine_settings() end)
 end
 
-local function add_grid_visualizer_params()
-  params:add_separator("grid_viz_sep", "Grid Visualizer")
-  params:add_control("vu_floor", "VU Floor", controlspec.new(0, 0.5, "lin", 0, 0.08, ""))
-  params:add_number("pitch_min_midi", "Pitch Min MIDI", 0, 127, 36)
-  params:add_number("pitch_max_midi", "Pitch Max MIDI", 0, 127, 96)
-  params:add_option("vu_mode", "VU Mode", {"column", "wide"}, 2)
-  params:add_option("line_mode", "Line Mode", {"threshold", "onset"}, 1)
-  params:add_option("vu_test_mode", "VU Test Animation", {"off", "on"}, 2)  -- Oletuksena päällä
-  params:set_action("vu_test_mode", function(value)
-    state.vu_test_mode = (value == 2)
-  end)
-end
-
-local function apply_grid_defaults_for_size(cols, rows)
-  if cols <= 0 or rows <= 0 then
-    return
-  end
-
-  if cols <= 8 and rows <= 8 then
-    params:set("vu_mode", option_index({"column", "wide"}, "column"))
-    params:set("pitch_min_midi", 48)
-    params:set("pitch_max_midi", 84)
-  else
-    params:set("vu_mode", option_index({"column", "wide"}, "wide"))
-    params:set("pitch_min_midi", 36)
-    params:set("pitch_max_midi", 96)
-  end
-end
-
 local function setup_params()
   params:add_separator("script_sep", "notetalk")
   add_input_params()
@@ -886,13 +868,25 @@ local function setup_params()
   add_mapping_params()
   add_midi_params()
   add_synth_and_fx_params()
-  add_grid_visualizer_params()
+  if grid_visualizer then
+    grid_visualizer:add_params()
+  end
   params:bang()
 end
 
 local function setup_debug_sample_defaults()
-  local debug_path = _path.audio .. DEBUG_SAMPLE_RELATIVE_PATH
-  local info_ok = pcall(audio.file_info, debug_path)
+  local base = (_path.audio and _path.audio:gsub("/$", "")) or "/home/we/dust/audio"
+  local rel = DEBUG_SAMPLE_RELATIVE_PATH:gsub("^/", "")
+  -- Try lowercase first (kantama), then Kantama (case can differ per device)
+  local debug_path = base .. "/" .. rel
+  local info_ok, _ = pcall(audio.file_info, debug_path)
+  if not info_ok then
+    local alt = base .. "/" .. rel:gsub("^kantama", "Kantama")
+    if alt ~= debug_path then
+      info_ok, _ = pcall(audio.file_info, alt)
+      if info_ok then debug_path = alt end
+    end
+  end
   if not info_ok then
     return
   end
@@ -911,8 +905,8 @@ end
 
 local function schedule_debug_sample_defaults()
   defer_clock(function()
-    -- Short delay avoids first-frame race while keeping startup autoload behavior.
-    clock.sleep(0.25)
+    -- Delay so audio/softcut and engine are ready before loading sample at boot.
+    clock.sleep(1.2)
     if state.freeze then
       return
     end
@@ -920,144 +914,16 @@ local function schedule_debug_sample_defaults()
   end)
 end
 
-local function draw_grid()
-  if not g then return end
-  
-  local cols = grid_cols or g.cols or 16
-  local rows = grid_rows or g.rows or 8
-  if cols < 1 or rows < 1 then return end
-  
-  local ok, err = pcall(function()
-    g:all(0)
-    
-    local vu_floor = 0.02
-    local vu_mode = "wide"
-    pcall(function()
-      vu_floor = params:get("vu_floor") or vu_floor
-      vu_mode = params:string("vu_mode") or vu_mode
-    end)
-    
-    -- Spektrogrammi-VU: jokaiselle sarakkeelle oma taajuus/amplitudi
-    if state.vu_test_mode then
-      local t = util.time()
-      for x = 1, cols do
-        local freq_ratio = (x - 1) / math.max(1, cols - 1)
-        local freq = 0.5 + freq_ratio * 3.0
-        local phase = t * freq * math.pi * 2
-        local amp = 0.3 + (math.sin(phase) * 0.35 + 0.35) * 0.7
-        local noise = math.sin(phase * 1.7) * 0.1
-        amp = clamp(amp + noise, 0, 1)
-        
-        local lit_rows_for_col = math.max(1, round(amp * rows))
-        for i = 0, lit_rows_for_col - 1 do
-          local y = rows - i
-          if y >= 1 and y <= rows then
-            local brightness = clamp(4 + round(11 * (i / math.max(1, lit_rows_for_col - 1))), 4, 15)
-            g:led(x, y, brightness)
-          end
-        end
-      end
-    else
-      local sample_mode = source_is_sample()
-      local direct_amp = 0
-      if sample_mode then
-        direct_amp = math.max(state.amp_out_l or 0, state.amp_out_r or 0)
-      else
-        direct_amp = math.max(state.amp_in_l or 0, state.amp_in_r or 0)
-      end
-      
-      local vu_from_level = clamp(state.vu_level or 0, 0, 1)
-      local vu_from_polls = math.min(1, direct_amp * 50)
-      local vu_amp = math.max(vu_from_level, vu_from_polls)
-      
-      local pitch_min = params:get("pitch_min_midi") or 36
-      local pitch_max = params:get("pitch_max_midi") or 96
-      local pitch_x = nil
-      if state.pitch_midi and state.pitch_midi >= pitch_min and state.pitch_midi <= pitch_max then
-        pitch_x = pitch_to_x(state.pitch_midi, cols, pitch_min, pitch_max)
-      end
-      
-      for x = 1, cols do
-        local col_amp = 0
-        if pitch_x and x == pitch_x then
-          col_amp = vu_amp * 1.2
-        else
-          col_amp = vu_amp * 0.3
-        end
-        col_amp = clamp(col_amp, 0, 1)
-        
-        if col_amp > 0.01 then
-          local lit_rows_for_col = math.max(1, round(col_amp * rows))
-          for i = 0, lit_rows_for_col - 1 do
-            local y = rows - i
-            if y >= 1 and y <= rows then
-              local brightness = clamp(4 + round(11 * (i / math.max(1, lit_rows_for_col - 1))), 4, 15)
-              g:led(x, y, brightness)
-            end
-          end
-        end
-      end
-      
-      if vu_amp < 0.01 then
-        local y_bottom = rows
-        for x = 1, cols do
-          g:led(x, y_bottom, 1)
-        end
-      end
-    end
-    
-    g:refresh()
-  end)
-  if not ok and err then
-  end
+set_active_line_from_event = function(_event)
+  -- Grid line effects can be added here or in grid_visualizer
 end
-
-set_active_line_from_event = function(event)
-  -- Grid line effects can be added here later if needed
-  -- For now, VU meter in draw_grid() is sufficient
-end
-
 
 local function setup_grid()
-  -- Käytä suoraa grid.connect(1) kuten standardi grid-API (midigrid hoitaa automaattisesti)
-  g = grid.connect(1)
-  
-  if g then
-    -- Käytä gridin raportoimia dimensioita suoraan (midigrid asettaa ne automaattisesti)
-    grid_cols = g.cols or 16
-    grid_rows = g.rows or 8
-    
-    -- Jos dimensiot ovat 0 tai puuttuvat, aseta oletukset
-    if grid_cols == 0 or grid_rows == 0 then
-      grid_cols = 16
-      grid_rows = 8
-    end
-    
-    -- Varmista että dimensiot ovat asetettu grid-olioon
-    if g.cols then g.cols = grid_cols end
-    if g.rows then g.rows = grid_rows end
-    
-    apply_grid_defaults_for_size(grid_cols, grid_rows)
-    
-    g.key = function(x, y, z) end
-    
-    draw_grid()
-    
-    if grid_redraw_metro then
-      pcall(function() grid_redraw_metro:stop() end)
-      grid_redraw_metro = nil
-    end
-    grid_redraw_metro = metro.init()
-    if grid_redraw_metro then
-      grid_redraw_metro.time = 1 / 30
-      grid_redraw_metro.event = function() draw_grid() end
-      grid_redraw_metro:start()
-    end
-    
-    grid.add = function()
-      setup_grid()
-    end
-  end
+  if not grid_visualizer then return end
+  grid_visualizer:setup()
+  g = grid_visualizer.g
+  grid_cols = grid_visualizer.grid_cols
+  grid_rows = grid_visualizer.grid_rows
 end
 
 local function analyzer_loop()
@@ -1086,13 +952,11 @@ local function analyzer_loop()
     local amp_raw = 0
     
     if sample_mode then
-      -- For sample mode, prioritize output channels as they carry the softcut signal
-      -- Monitor inputs as secondary since they may have noise floor issues
-      local amp_out = math.max(state.amp_out_l or 0, state.amp_out_r or 0)
+      -- amp_out_l/r do NOT include softcut on Norns (engine only). Use input as primary
+      -- so that routing output->input (or line-in with the sample) can trigger notes.
       local amp_in = math.max(state.amp_in_l or 0, state.amp_in_r or 0)
-      
-      -- Use output as primary, input as fallback
-      amp_raw = math.max(amp_out, amp_in * 0.7)
+      local amp_out = math.max(state.amp_out_l or 0, state.amp_out_r or 0)
+      amp_raw = math.max(amp_in, amp_out * 0.7)
       
       -- Fallback detection: if all polls are near zero but we have a sample loaded,
       -- trigger audio service to re-establish monitor routing
@@ -1138,11 +1002,13 @@ local function analyzer_loop()
       })
     end
     local amp = clamp(amp_raw, 0, 1)
-    local pitch = state.pitch_hz
+    local raw_pitch_hz = state.pitch_hz
     local confidence = clamp(state.pitch_conf or 0, 0, 1)
     local min_conf = params:get("min_conf")
-    if pitch and pitch > 0 and confidence >= min_conf then
-      push_voiced_pitch(pitch, state.now_ms)
+
+    -- Pitch service: 100 ms–grid–normalized pitch (sample or live); always in state for combining with onsets
+    if pitch_service then
+      pitch_service:update(state.now_ms, raw_pitch_hz, confidence, min_conf, sample_mode, amp, params:get("midi_min"), params:get("midi_max"))
     end
 
     local amp_trigger_metric = amp_raw  -- Always use raw signal for trigger detection
@@ -1195,22 +1061,17 @@ local function analyzer_loop()
       amp_trigger_metric = amp_raw
     end
 
-    if sample_mode and (pitch == nil or pitch <= 0 or confidence < min_conf) then
-      -- Fallback pitch: map current amplitude to MIDI range (more expressive than fixed pitch).
-      pitch = recent_voiced_pitch(state.now_ms, 700)
-      if not pitch then
-        local midi_min = params:get("midi_min")
-        local midi_max = params:get("midi_max")
-        local amp_norm_pitch = clamp(amp, 0, 1)
-        local amp_midi = midi_min + round(amp_norm_pitch * (midi_max - midi_min))
-        pitch = musicutil.note_num_to_freq(clamp(amp_midi, midi_min, midi_max))
-      end
-      confidence = 1
+    -- Display: 100 ms–normalized pitch when available (pitch service), else raw
+    if pitch_service then
+      local ps = pitch_service:get_state()
+      state.pitch_midi = ps.normalized_pitch_midi or current_pitch_midi()
+    else
+      state.pitch_midi = current_pitch_midi()
     end
 
-    state.amp_pulse = state.amp_pulse * 0.9
+    -- Sample-tilassa hieman hitaampi decay, jotta grid-VU näkyy transientin aallonpituudelta
+    state.amp_pulse = state.amp_pulse * (sample_mode and 0.97 or 0.9)
     state.amp_norm = math.max(amp, state.amp_pulse)
-    state.pitch_midi = current_pitch_midi()
     
     -- VU: käytä suoraan raakaa signaalia ilman normalisointia, vahvistus jotta palkki liikkuu
     -- Sample-tilassa käytä ulostuloa, line-in-tilassa sisääntuloa
@@ -1226,92 +1087,24 @@ local function analyzer_loop()
     local instant = math.max(vu_scaled, state.amp_norm or 0)
     state.vu_level = math.max(instant, (state.vu_level or 0) * 0.99)  -- Hitaampi decay
 
-    -- Sample-mode trigger from transients, not fixed clock.
-    local threshold = params:get("threshold")
-    local effective_threshold = threshold
-    
-    if sample_mode then
-      -- Adaptive threshold based on current signal characteristics
-      local min_threshold = math.max(0.001, state.amp_floor_est * 1.5)
-      local max_threshold = math.min(0.15, state.amp_ceil_est * 0.3)
-      
-      -- Allow user threshold but constrain to reasonable bounds
-      effective_threshold = clamp(threshold, min_threshold, max_threshold)
-      
-      -- If normalized amp is being used for display, adjust threshold accordingly
-      if state.amp_ceil_est > state.amp_floor_est then
-        local norm_threshold = (effective_threshold - state.amp_floor_est) / 
-                              (state.amp_ceil_est - state.amp_floor_est)
-        norm_threshold = clamp(norm_threshold, 0.05, 0.8)
-        -- Keep original threshold for raw signal comparison
-      end
-      
-      if debug_should_log("threshold_adaptation", 3.0) then
-        debug_log("H11", "notetalk.lua:analyzer_loop", "threshold_adaptation", {
-          threshold_user = threshold,
-          threshold_effective = effective_threshold,
-          min_threshold = min_threshold,
-          max_threshold = max_threshold,
-          amp_floor_est = state.amp_floor_est,
-          amp_ceil_est = state.amp_ceil_est,
-          sample_mode = sample_mode,
-        })
-      end
-    end
-    local amp_delta = amp_trigger_metric - previous_amp
-    local onset_candidate = amp_trigger_metric >= effective_threshold
-    local onset_rise_ok = amp_delta >= 0.004
-    local refractory_ok = (state.now_ms - state.debug_last_trigger_ms) >= params:get("hold_ms")
-    local onset_accept = onset_candidate and onset_rise_ok and refractory_ok
-    if debug_should_log("onset_stage", 1.0) then
-      -- #region agent log
-      debug_log("H3", "notetalk.lua:analyzer_loop", "onset_stage", {
-        onset_candidate = onset_candidate,
-        onset_rise_ok = onset_rise_ok,
-        refractory_ok = refractory_ok,
-        onset_accept = onset_accept,
-        amp_delta = amp_delta,
-        amp = amp,
-        amp_trigger_metric = amp_trigger_metric,
-        amp_prev = previous_amp,
-        threshold = effective_threshold,
-        sample_mode = sample_mode,
-        hold_ms = params:get("hold_ms"),
-      })
-      -- #endregion
-    end
+    -- Onset service: hit detection only (sample or live); no pitch, combined with pitch service below
+    local onset_accept, trigger_amp, effective_threshold = OnsetService.detect({
+      now_ms = state.now_ms,
+      amp_trigger_metric = amp_trigger_metric,
+      previous_amp = previous_amp,
+      last_trigger_ms = state.debug_last_trigger_ms,
+      threshold = params:get("threshold"),
+      hold_ms = params:get("hold_ms"),
+      sample_mode = sample_mode,
+      amp_floor_est = state.amp_floor_est,
+      amp_ceil_est = state.amp_ceil_est,
+    })
     if onset_accept then
-      -- #region agent log
-      debug_log("H3", "notetalk.lua:analyzer_loop", "trigger_branch", {
-        threshold_cross = onset_candidate,
-        amp_rise_trigger = onset_rise_ok,
-        recovery_trigger = false,
-        amp = amp,
-        amp_trigger_metric = amp_trigger_metric,
-        amp_prev = previous_amp,
-        threshold = effective_threshold,
-        sample_mode = sample_mode,
-        hold_ms = params:get("hold_ms"),
-      })
-      -- #endregion
       state.debug_hit_count = state.debug_hit_count + 1
       state.debug_last_trigger_ms = state.now_ms
-      local trigger_amp = clamp(math.max(amp_trigger_metric, effective_threshold * 1.2), 0, 1)
       state.amp_pulse = math.max(state.amp_pulse, trigger_amp)
-      -- #region agent log
-      debug_log("H8", "notetalk.lua:analyzer_loop", "fallback_event_emit", {
-        trigger_amp = trigger_amp,
-        hz = (pitch and pitch > 0) and pitch or 220,
-        confidence = (confidence and confidence > 0) and confidence or 1,
-        threshold_cross = onset_candidate,
-        amp_rise_trigger = onset_rise_ok,
-      })
-      -- #endregion
-      handle_analysis_event({
-        hz = (pitch and pitch > 0) and pitch or 220,
-        confidence = (confidence and confidence > 0) and confidence or 1,
-        amp = trigger_amp,
-      })
+      local hz = pitch_service and pitch_service:get_current_hz(state.now_ms) or 220
+      handle_analysis_event({ hz = hz, confidence = 1, amp = trigger_amp })
     end
     if debug_should_log("analyzer_summary", 2.0) then
       -- #region agent log
@@ -1326,7 +1119,7 @@ local function analyzer_loop()
         amp_in_l = state.amp_in_l or 0,
         amp_in_r = state.amp_in_r or 0,
         amp_prev = previous_amp,
-        pitch_hz = pitch or -1,
+        pitch_hz = (pitch_service and (pitch_service:get_state()).normalized_pitch_hz) or raw_pitch_hz or -1,
         conf = confidence,
         hit_count = state.debug_hit_count,
         sample_mode = sample_mode,
@@ -1341,7 +1134,8 @@ local function analyzer_loop()
     
     previous_amp = amp_trigger_metric
 
-    analyzer:process_observation(amp, pitch, confidence, state.now_ms)
+    local obs_pitch = (pitch_service and (pitch_service:get_state()).normalized_pitch_hz) or raw_pitch_hz
+    analyzer:process_observation(amp, obs_pitch, confidence, state.now_ms)
 
     ::continue::
   end
@@ -1355,10 +1149,14 @@ local function redraw_loop()
 end
 
 function init()
-  if grid_redraw_metro then
-    pcall(function() grid_redraw_metro:stop() end)
-    grid_redraw_metro = nil
-  end
+  grid_visualizer = GridVisualizer.new({
+    state = state,
+    params = params,
+    source_is_sample = source_is_sample,
+    option_index = option_index,
+    connect_grid = function() return grid.connect(1) end,
+    grid_module = grid,
+  })
   if analysis_clock then
     pcall(function() clock.cancel(analysis_clock) end)
     analysis_clock = nil
@@ -1368,11 +1166,12 @@ function init()
     redraw_clock = nil
   end
   analyzer = Analyzer.new({
-    threshold = 0.05,
-    min_conf = 0.45,
+    threshold = 0.02,
+    min_conf = 0.35,
     hold_ms = 140,
     window_ms = 120,
   })
+  pitch_service = PitchService.new({ grid_ms = 100 })
   midi_out = MidiOut.new()
   audio_service = AudioService.new()
 
@@ -1388,7 +1187,130 @@ function init()
   end
   update_source_label()
   apply_engine_settings()
-  play_boot_test_tone()
+  
+  -- Ensure engine is loaded (shields may have no default engine)
+  -- Try multiple engines and methods to find one that works
+  defer_clock(function()
+    clock.sleep(0.15)
+    if state.freeze then return end
+    
+    local function try_engine(name)
+      print("notetalk: trying engine: " .. name)
+      local ok = pcall(function() engine.name = name end)
+      if ok then
+        clock.sleep(0.8) -- Wait longer for engine to fully initialize and register commands
+        local name_ok, current_name = pcall(function() return engine.name end)
+        if name_ok and current_name == name then
+          -- Check if engine has any commands available
+          local has_hz = pcall(function() return engine.hz ~= nil end)
+          local has_amp = pcall(function() return engine.amp ~= nil end)
+          local has_level = pcall(function() return engine.level ~= nil end)
+          local has_noteOn = pcall(function() return engine.noteOn ~= nil end)
+          
+          print("notetalk: engine " .. name .. " loaded, commands - hz:" .. tostring(has_hz) .. 
+                " amp:" .. tostring(has_amp) .. " level:" .. tostring(has_level) .. 
+                " noteOn:" .. tostring(has_noteOn))
+          
+          if has_hz or has_amp or has_level or has_noteOn then
+            print("notetalk: engine " .. name .. " commands verified and tested")
+            -- Capture function refs immediately (norns engine can return nil on later lookup)
+            local noteOn_fn = engine.noteOn
+            local noteOff_fn = engine.noteOff
+            local hz_fn = engine.hz
+            local amp_fn = engine.amp
+            local boot_played = false
+            if noteOn_fn and type(noteOn_fn) == "function" then
+              local ok, err = pcall(function() noteOn_fn(0.35) end)
+              if ok then
+                print("notetalk: boot tone started via noteOn")
+                defer_clock(function()
+                  clock.sleep(0.2)
+                  if state.freeze then return end
+                  if noteOff_fn and type(noteOff_fn) == "function" then
+                    pcall(function() noteOff_fn() end)
+                  else
+                    pcall(function() engine.noteOff() end)
+                  end
+                  print("notetalk: boot tone ended")
+                end)
+                boot_played = true
+              else
+                print("notetalk: noteOn failed: " .. tostring(err))
+              end
+            end
+            if not boot_played and hz_fn and amp_fn and type(hz_fn) == "function" and type(amp_fn) == "function" then
+              local ok_hz, err_hz = pcall(function() hz_fn(440) end)
+              local ok_amp, err_amp = pcall(function() amp_fn(0.35) end)
+              if ok_hz and ok_amp then
+                print("notetalk: boot tone started (hz/amp)")
+                defer_clock(function()
+                  clock.sleep(0.2)
+                  if state.freeze then return end
+                  pcall(function() amp_fn(0) end)
+                  print("notetalk: boot tone ended")
+                end)
+                boot_played = true
+              else
+                print("notetalk: hz/amp failed - hz:" .. tostring(err_hz) .. " amp:" .. tostring(err_amp))
+              end
+            end
+            if not boot_played then
+              print("notetalk: boot tone not played (engine may need different call)")
+            end
+            return true
+          else
+            print("notetalk: WARNING - engine " .. name .. " loaded but no commands available")
+            return false
+          end
+        else
+          print("notetalk: WARNING - engine.name set but verification failed: " .. tostring(current_name))
+          return false
+        end
+      else
+        print("notetalk: failed to set engine.name to " .. name)
+        return false
+      end
+    end
+    
+    -- Try engines in order of preference
+    local engines_to_try = {"PolyPerc", "TestSine", "SimplePassThru"}
+    local engine_loaded = false
+    
+    for _, engine_name in ipairs(engines_to_try) do
+      if try_engine(engine_name) then
+        print("notetalk: successfully loaded engine: " .. engine_name)
+        engine_loaded = true
+        -- Re-apply settings after engine load
+        apply_engine_settings()
+        -- Verify audio levels
+        pcall(function() 
+          audio.level_dac(1.0)
+          audio.level_cut(1.0)
+          local synth_on = params:string("use_synth") == "on"
+          local synth_level = params:get("synth_level")
+          audio.level_eng_cut(synth_on and synth_level or 0)
+          print("notetalk: audio levels set - DAC:1.0, CUT:1.0, ENG_CUT:" .. (synth_on and synth_level or 0))
+        end)
+        break
+      end
+    end
+    
+    if not engine_loaded then
+      print("notetalk: WARNING - failed to load any working engine")
+    end
+  end)
+  
+  -- Apply sample_level from params after a short delay (audio system ready)
+  defer_clock(function()
+    clock.sleep(0.1)
+    if state.freeze then return end
+    local sl = 0.8
+    if params and params.get then
+      local ok, v = pcall(function() return params:get("sample_level") end)
+      if ok and v then sl = v end
+    end
+    pcall(function() softcut.level(1, sl) end)
+  end)
   
   analysis_clock = clock.run(analyzer_loop)
   redraw_clock = clock.run(redraw_loop)
@@ -1409,8 +1331,8 @@ function enc(n, d)
     params:set("synth_level", v)
     local synth_on = params:string("use_synth") == "on"
     local target_level = synth_on and v or 0
-    engine.amp(target_level)
-    engine.level(target_level)
+    pcall(function() engine.amp(target_level) end)
+    pcall(function() engine.level(target_level) end)
   end
   redraw()
 end
@@ -1510,20 +1432,15 @@ function cleanup()
     pcall(function() midi_out:cleanup() end)
   end
   
-  -- Turvallinen metro-pysäytys
-  if grid_redraw_metro then
-    pcall(function() grid_redraw_metro:stop() end)
-    grid_redraw_metro = nil
+  if grid_visualizer then
+    pcall(function() grid_visualizer:stop() end)
   end
+  g = nil
+  grid_cols = 0
+  grid_rows = 0
   if pitch_retry_metro then
     pcall(function() pitch_retry_metro:stop() end)
     pitch_retry_metro = nil
-  end
-  
-  -- Grid cleanup
-  if g then
-    pcall(function() g:all(0); g:refresh() end)
-    g = nil
   end
   
   -- ENGINE CLEANUP - yksinkertainen
@@ -1541,6 +1458,7 @@ function cleanup()
   state.pitch_hz = nil
   state.pitch_conf = 0
   state.pitch_midi = nil
+  if pitch_service then pitch_service:reset() end
   
   -- Turvallinen clock-peruutus
   if analysis_clock then

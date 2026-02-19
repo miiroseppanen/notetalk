@@ -72,6 +72,11 @@ function AudioService:load_sample(path, defer_clock_fn)
   if not path or path == "" then
     return false
   end
+  -- Ensure full path for buffer_read_mono (device differences)
+  path = path:gsub("^%s+", ""):gsub("%s+$", "")
+  if path:sub(1, 1) ~= "/" then
+    path = "/home/we/dust/audio/" .. path:gsub("^/", "")
+  end
 
   local ok, err = pcall(function()
     self:setup_defaults()
@@ -87,8 +92,15 @@ function AudioService:load_sample(path, defer_clock_fn)
     softcut.buffer_clear()
     softcut.buffer_read_mono(path, 0, 0, -1, 1, 1, 0)
     
-    -- Wait for buffer read to complete before starting playback
-    clock.sleep(0.1)
+    -- Wait for buffer read to complete (longer on slow devices / at boot)
+    clock.sleep(0.4)
+    
+    -- Set loop_end before playback so loop is correct
+    local _, frames, sample_rate = audio.file_info(path)
+    if frames and sample_rate and sample_rate > 0 then
+      local duration = frames / sample_rate
+      pcall(function() softcut.loop_end(1, math.max(0.2, duration)) end)
+    end
     
     -- Ensure proper signal routing before playback
     pcall(function() audio.level_cut(1.0) end) -- Route softcut to output
@@ -101,18 +113,22 @@ function AudioService:load_sample(path, defer_clock_fn)
   if ok then
     self.sample_loaded = true
     self.sample_path = path
-
-    local _, frames, sample_rate = audio.file_info(path)
-    if frames and sample_rate and sample_rate > 0 then
-      local duration = frames / sample_rate
-      pcall(function() softcut.loop_end(1, math.max(0.2, duration)) end)
-    end
-    -- Ensure playback is running after read starts.
+    -- Ensure playback and routing (first run soon, second run later for slow/different devices)
     if defer_clock_fn then
-      defer_clock_fn(function()
-        clock.sleep(0.1)
+      local function ensure_playback()
+        pcall(function() audio.level_dac(1.0) end)
+        pcall(function() audio.level_cut(1.0) end)
         pcall(function() softcut.position(1, 0) end)
         pcall(function() softcut.play(1, 1) end)
+        pcall(function() softcut.level(1, 0.9) end)
+      end
+      defer_clock_fn(function()
+        clock.sleep(0.15)
+        ensure_playback()
+      end)
+      defer_clock_fn(function()
+        clock.sleep(0.6)
+        ensure_playback()
       end)
     end
     return true
