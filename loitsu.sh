@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-N_HOST="${1:-norns.local}"
+N_HOST="${1:-norns-shield.local}"
 N_USER="${N_USER:-we}"
 APP_NAME="notetalk"
 APP_DIR="/home/${N_USER}/dust/code/${APP_NAME}"
