@@ -517,10 +517,14 @@ local function trigger_synth(note, amp)
     return
   end
 
+  local synth_level = params:get("synth_level")
+  -- Re-apply engine routing and level so notes are guaranteed to be audible.
+  apply_engine_settings()
+
   local hz = musicutil.note_num_to_freq(note)
   local amp_norm = clamp(amp or 0.2, 0, 1)
   -- Higher floor and scale so notes are clearly audible (0.5–1.0 range before synth_level).
-  local level = clamp(0.5 + (amp_norm * 0.5), 0, 1) * params:get("synth_level")
+  local level = clamp(0.5 + (amp_norm * 0.5), 0, 1) * synth_level
   level = clamp(level, 0, 1)
 
   pcall(function() engine.hz(hz) end)
@@ -557,8 +561,13 @@ local function handle_analysis_event(event)
   state.last_event_conf = event.confidence
   state.last_event_amp = event.amp
 
-  midi_out:set_note_length_ms(params:get("note_length_ms"))
-  midi_out:trigger_note(note, event.amp)
+  if midi_out then
+    pcall(function()
+          midi_out:set_note_length_ms(params:get("note_length_ms"))
+          midi_out:trigger_note(note, event.amp)
+    end)
+  end
+  -- Synth trigger: always run so notes are audible even if MIDI fails
   trigger_synth(note, event.amp)
   -- Enhanced debug logging for note triggering
   debug_log("H4", "notetalk.lua:handle_analysis_event", "triggered_note", {
@@ -772,7 +781,7 @@ local function add_input_params()
   params:add_trigger("clear_sample", "Clear Sample")
   params:set_action("clear_sample", function() unload_sample() end)
 
-  params:add_control("sample_level", "Sample Level", controlspec.new(0, 1, "lin", 0, 1.0, ""))
+  params:add_control("sample_level", "Sample Level", controlspec.new(0, 1, "lin", 0, 0.5, ""))
   params:set_action("sample_level", function(value)
     pcall(function() softcut.level(1, value) end)
   end)
@@ -851,7 +860,7 @@ local function add_synth_and_fx_params()
   params:add_option("use_synth", "Use Synth", {"off", "on"}, 2)
   params:set_action("use_synth", function() apply_engine_settings() end)
 
-  params:add_control("synth_level", "Synth Level", controlspec.new(0, 1, "lin", 0, 0.8, ""))
+  params:add_control("synth_level", "Synth Level", controlspec.new(0, 1, "lin", 0, 1.0, ""))
   params:set_action("synth_level", function() apply_engine_settings() end)
 
   params:add_control("fx_reverb_send", "FX Reverb Send", controlspec.new(0, 1, "lin", 0, 0.2, ""))
@@ -898,8 +907,8 @@ local function setup_debug_sample_defaults()
   params:set("min_conf", 0.2)
   params:set("window_ms", 140)
   params:set("note_length_ms", 180)
-  params:set("sample_level", 1.0)
-  params:set("synth_level", 0.8)
+  params:set("sample_level", 0.5)
+  params:set("synth_level", 1.0)
   load_sample(debug_path)
 end
 
