@@ -907,15 +907,13 @@ end
 local function draw_grid()
   if not g then return end
   
-  -- Varmista että käytämme koko gridin leveyttä (16x8 kahdelle Launchpadille)
-  local cols = math.max(grid_cols or g.cols or 16, 16)
-  local rows = math.max(grid_rows or g.rows or 8, 8)
+  local cols = grid_cols or g.cols or 16
+  local rows = grid_rows or g.rows or 8
   if cols < 1 or rows < 1 then return end
   
   local ok, err = pcall(function()
     g:all(0)
     
-    -- Turvallinen param-luku (draw_grid voi kutsua ennen params:bang())
     local vu_floor = 0.02
     local vu_mode = "wide"
     pcall(function()
@@ -925,34 +923,25 @@ local function draw_grid()
     
     -- Spektrogrammi-VU: jokaiselle sarakkeelle oma taajuus/amplitudi
     if state.vu_test_mode then
-      -- TESTI: Spektrogrammi-animaatio - eri taajuudet eri sarakkeissa
       local t = util.time()
       for x = 1, cols do
-        -- Jokaiselle sarakkeelle eri taajuus (logaritminen skaalaus)
-        local freq_ratio = (x - 1) / math.max(1, cols - 1)  -- 0..1
-        local freq = 0.5 + freq_ratio * 3.0  -- 0.5-3.5 Hz (eri nopeudet)
-        
-        -- Siniaalto eri vaiheilla ja amplitudilla
+        local freq_ratio = (x - 1) / math.max(1, cols - 1)
+        local freq = 0.5 + freq_ratio * 3.0
         local phase = t * freq * math.pi * 2
-        local amp = 0.3 + (math.sin(phase) * 0.35 + 0.35) * 0.7  -- 0.3-1.0
-        
-        -- Lisää hieman satunnaisuutta ja decay-efektiä
+        local amp = 0.3 + (math.sin(phase) * 0.35 + 0.35) * 0.7
         local noise = math.sin(phase * 1.7) * 0.1
         amp = clamp(amp + noise, 0, 1)
         
-        -- Piirrä sarake alhaalta ylös
         local lit_rows_for_col = math.max(1, round(amp * rows))
         for i = 0, lit_rows_for_col - 1 do
           local y = rows - i
           if y >= 1 and y <= rows then
-            -- Kirkkaampi ylhäällä
             local brightness = clamp(4 + round(11 * (i / math.max(1, lit_rows_for_col - 1))), 4, 15)
             g:led(x, y, brightness)
           end
         end
       end
     else
-      -- OIKEA VU: käytä pitch-dataa ja amplitudia
       local sample_mode = source_is_sample()
       local direct_amp = 0
       if sample_mode then
@@ -965,7 +954,6 @@ local function draw_grid()
       local vu_from_polls = math.min(1, direct_amp * 50)
       local vu_amp = math.max(vu_from_level, vu_from_polls)
       
-      -- Jos on pitch-data, näytä se oikeassa sarakkeessa
       local pitch_min = params:get("pitch_min_midi") or 36
       local pitch_max = params:get("pitch_max_midi") or 96
       local pitch_x = nil
@@ -973,18 +961,13 @@ local function draw_grid()
         pitch_x = pitch_to_x(state.pitch_midi, cols, pitch_min, pitch_max)
       end
       
-      -- Piirrä spektrogrammi: jokaiselle sarakkeelle amplitudi
       for x = 1, cols do
         local col_amp = 0
-        
-        -- Jos tämä sarake on pitch-sijainti, käytä korkeampaa amplitudia
         if pitch_x and x == pitch_x then
-          col_amp = vu_amp * 1.2  -- Vahvista pitch-saraketta
+          col_amp = vu_amp * 1.2
         else
-          -- Muille sarakkeille pienempi amplitudi (taustakohina)
           col_amp = vu_amp * 0.3
         end
-        
         col_amp = clamp(col_amp, 0, 1)
         
         if col_amp > 0.01 then
@@ -999,7 +982,6 @@ local function draw_grid()
         end
       end
       
-      -- Jos ei signaalia ollenkaan, näytä yksi himmeä rivi alhaalla
       if vu_amp < 0.01 then
         local y_bottom = rows
         for x = 1, cols do
@@ -1011,7 +993,6 @@ local function draw_grid()
     g:refresh()
   end)
   if not ok and err then
-    -- Virhe piirrossa – älä kaada, mutta voisi logata
   end
 end
 
@@ -1023,44 +1004,18 @@ end
 
 local function setup_grid()
   g = nil
-  do
-    local ok, conn = pcall(function() return grid.connect() end)
-    if ok and conn then
-      g = conn
-    end
-    if not g then
-      g = grid.connect(1)
-    end
+  
+  -- Käytä midigridin automaattista tunnistusta (kuten Awake)
+  local ok, conn = pcall(function() return grid.connect() end)
+  if not (ok and conn) then
+    conn = grid.connect(1)
   end
   
-  if g then
-    -- Midigrid kahdella Launchpadilla: käytä koko 16x8 gridiä
-    -- Midigrid raportoi 8x8 per Launchpad, mutta meidän pitää käyttää koko 16x8
-    local reported_cols = g.cols or 0
-    local reported_rows = g.rows or 0
-    
-    -- Jos dimensiot ovat 8x8, oletetaan että on kaksi Launchpadia yhdistettynä
-    -- Pakota 16x8 jotta käytämme koko gridin leveyttä
-    if reported_cols == 8 and reported_rows == 8 then
-      grid_cols = 16  -- Kaksi Launchpadia vaakasuunnassa = 16 saraketta
-      grid_rows = 8
-    elseif reported_cols >= 16 then
-      -- Jos grid raportoi jo 16+, käytä sitä
-      grid_cols = reported_cols
-      grid_rows = reported_rows
-    else
-      -- Oletus: pakota 16x8
-      grid_cols = 16
-      grid_rows = 8
-    end
-    
-    -- Varmista että käytämme koko gridin leveyttä
-    grid_cols = math.max(grid_cols, 16)
-    grid_rows = math.max(grid_rows, 8)
-    
-    -- Pakota dimensiot grid-olioon
-    if g.cols then g.cols = grid_cols end
-    if g.rows then g.rows = grid_rows end
+  if conn then
+    g = conn
+    -- Käytä gridin raportoimia dimensioita (midigrid hoitaa automaattisesti kaksi Launchpadia)
+    grid_cols = g.cols or 16
+    grid_rows = g.rows or 8
     
     apply_grid_defaults_for_size(grid_cols, grid_rows)
     
@@ -1079,7 +1034,6 @@ local function setup_grid()
       grid_redraw_metro:start()
     end
     
-    -- Kun grid liitetään myöhemmin, päivitä
     grid.add = function()
       setup_grid()
     end
