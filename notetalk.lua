@@ -1,12 +1,18 @@
-engine.name = "wordpitch_engine"
+-- notetalk
+-- Speek to notes
+-- Kantama
+-- v1.0.0 @2026
+--  
+
+engine.name = "PolyPerc"
 
 local fileselect = require "fileselect"
 local grid = require "grid"
 local musicutil = require "musicutil"
 
-local Analyzer = require "lib.analyzer"
-local Mapping = require "lib.mapping"
-local MidiOut = require "lib.midi_out"
+local Analyzer = include("lib/analyzer")
+local Mapping = include("lib/mapping")
+local MidiOut = include("lib/midi_out")
 
 local analyzer
 local midi_out
@@ -46,6 +52,7 @@ local active_line_t0 = nil
 local set_active_line_from_event = nil
 
 local LINE_FADE_MS = 500
+local DEBUG_SAMPLE_RELATIVE_PATH = "kantama/land is burning.wav"
 
 local SCALE_NAMES = Mapping.get_scale_names()
 
@@ -234,11 +241,17 @@ local function trigger_synth(note, amp)
   local level = clamp(amp or 0.2, 0, 1)
 
   pcall(function() engine.hz(hz) end)
-  pcall(function() engine.noteOn(level) end)
-  clock.run(function()
-    clock.sleep(params:get("note_length_ms") / 1000)
-    pcall(function() engine.noteOff() end)
-  end)
+
+  -- Prefer gated engines when available; otherwise trigger as one-shot.
+  local ok_note_on = pcall(function() engine.noteOn(level) end)
+  if ok_note_on then
+    clock.run(function()
+      clock.sleep(params:get("note_length_ms") / 1000)
+      pcall(function() engine.noteOff() end)
+    end)
+  else
+    pcall(function() engine.amp(level) end)
+  end
 end
 
 local function handle_analysis_event(event)
@@ -273,9 +286,30 @@ local function setup_polls()
     return nil
   end
 
-  amp_poll = try_poll("amp_in_l", function(value) state.amp_in = math.abs(value or 0) end)
-  pitch_poll = try_poll("pitch_in", function(value) state.pitch_hz = value end)
-  conf_poll = try_poll("pitch_conf", function(value) state.pitch_conf = value end)
+  -- Prefer output-side analysis polls so softcut/sample source is visible.
+  local amp_poll_names = {"amp_out_l", "amp_in_l"}
+  for _, name in ipairs(amp_poll_names) do
+    amp_poll = try_poll(name, function(value) state.amp_in = math.abs(value or 0) end)
+    if amp_poll then
+      break
+    end
+  end
+
+  local pitch_poll_names = {"pitch_in", "pitch_out"}
+  for _, name in ipairs(pitch_poll_names) do
+    pitch_poll = try_poll(name, function(value) state.pitch_hz = value end)
+    if pitch_poll then
+      break
+    end
+  end
+
+  local conf_poll_names = {"pitch_conf", "pitch_out_conf"}
+  for _, name in ipairs(conf_poll_names) do
+    conf_poll = try_poll(name, function(value) state.pitch_conf = value end)
+    if conf_poll then
+      break
+    end
+  end
 end
 
 local function cleanup_polls()
@@ -424,6 +458,25 @@ local function setup_params()
   add_synth_and_fx_params()
   add_grid_visualizer_params()
   params:bang()
+end
+
+local function setup_debug_sample_defaults()
+  local debug_path = _path.audio .. DEBUG_SAMPLE_RELATIVE_PATH
+  local info_ok, _, _, channels = pcall(audio.file_info, debug_path)
+  if not info_ok or not channels then
+    return
+  end
+
+  params:set("input_mode", option_index({"audio_in", "softcut"}, "softcut"))
+  params:set("sample_enabled", option_index({"off", "on"}, "on"))
+  params:set("use_synth", option_index({"off", "on"}, "on"))
+  params:set("midi_send", option_index({"off", "on"}, "off"))
+  params:set("threshold", 0.02)
+  params:set("min_conf", 0.2)
+  params:set("window_ms", 140)
+  params:set("note_length_ms", 180)
+
+  load_sample(debug_path)
 end
 
 local function update_grid_dimensions()
@@ -623,6 +676,7 @@ function init()
   setup_params()
   setup_polls()
   setup_grid()
+  setup_debug_sample_defaults()
   update_source_label()
   apply_engine_settings()
 
