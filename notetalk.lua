@@ -922,14 +922,36 @@ local function draw_grid()
       vu_mode = params:string("vu_mode") or vu_mode
     end)
     
-    -- TESTI-VU: animoi siniaaltoa jos testi-tila päällä
-    local vu_amp = 0
+    -- Spektrogrammi-VU: jokaiselle sarakkeelle oma taajuus/amplitudi
     if state.vu_test_mode then
-      -- Siniaalto-animaatio: 0.2-0.9 välillä, ~2 sekunnin jakso
+      -- TESTI: Spektrogrammi-animaatio - eri taajuudet eri sarakkeissa
       local t = util.time()
-      vu_amp = 0.2 + (math.sin(t * math.pi) * 0.35 + 0.35)  -- 0.2-0.9
+      for x = 1, cols do
+        -- Jokaiselle sarakkeelle eri taajuus (logaritminen skaalaus)
+        local freq_ratio = (x - 1) / math.max(1, cols - 1)  -- 0..1
+        local freq = 0.5 + freq_ratio * 3.0  -- 0.5-3.5 Hz (eri nopeudet)
+        
+        -- Siniaalto eri vaiheilla ja amplitudilla
+        local phase = t * freq * math.pi * 2
+        local amp = 0.3 + (math.sin(phase) * 0.35 + 0.35) * 0.7  -- 0.3-1.0
+        
+        -- Lisää hieman satunnaisuutta ja decay-efektiä
+        local noise = math.sin(phase * 1.7) * 0.1
+        amp = clamp(amp + noise, 0, 1)
+        
+        -- Piirrä sarake alhaalta ylös
+        local lit_rows_for_col = math.max(1, round(amp * rows))
+        for i = 0, lit_rows_for_col - 1 do
+          local y = rows - i
+          if y >= 1 and y <= rows then
+            -- Kirkkaampi ylhäällä
+            local brightness = clamp(4 + round(11 * (i / math.max(1, lit_rows_for_col - 1))), 4, 15)
+            g:led(x, y, brightness)
+          end
+        end
+      end
     else
-      -- Oikea VU: käytä suoraan poll-arvoja tai vu_level
+      -- OIKEA VU: käytä pitch-dataa ja amplitudia
       local sample_mode = source_is_sample()
       local direct_amp = 0
       if sample_mode then
@@ -938,49 +960,50 @@ local function draw_grid()
         direct_amp = math.max(state.amp_in_l or 0, state.amp_in_r or 0)
       end
       
-      -- Käytä vu_level:ia jos se on suurempi, muuten käytä suoraa poll-arvoa vahvistettuna
       local vu_from_level = clamp(state.vu_level or 0, 0, 1)
-      local vu_from_polls = math.min(1, direct_amp * 50)  -- Erittäin vahva vahvistus
-      vu_amp = math.max(vu_from_level, vu_from_polls)
-    end
-    
-    local lit_rows = 0
-    
-    -- Näytä VU jos on mitään signaalia (hyvin matala kynnys)
-    -- Jos vu_amp on > 0, näytä vähintään yksi rivi
-    if vu_amp > 0.00001 then
-      -- Käytä koko amplitudin vaihteluväliä (0..1) suoraan rivimäärään
-      -- Varmista että vähintään yksi rivi näkyy jos on signaalia
-      lit_rows = math.max(1, math.min(rows, round(vu_amp * rows)))
-    end
-    
-    -- Aina näkyvä: joko VU-taso tai yksi himmeä rivi alhaalla (yhteys-indikaattori)
-    if lit_rows > 0 then
-      if vu_mode == "wide" then
-        for x = 1, cols do
-          for i = 0, lit_rows - 1 do
+      local vu_from_polls = math.min(1, direct_amp * 50)
+      local vu_amp = math.max(vu_from_level, vu_from_polls)
+      
+      -- Jos on pitch-data, näytä se oikeassa sarakkeessa
+      local pitch_min = params:get("pitch_min_midi") or 36
+      local pitch_max = params:get("pitch_max_midi") or 96
+      local pitch_x = nil
+      if state.pitch_midi and state.pitch_midi >= pitch_min and state.pitch_midi <= pitch_max then
+        pitch_x = pitch_to_x(state.pitch_midi, cols, pitch_min, pitch_max)
+      end
+      
+      -- Piirrä spektrogrammi: jokaiselle sarakkeelle amplitudi
+      for x = 1, cols do
+        local col_amp = 0
+        
+        -- Jos tämä sarake on pitch-sijainti, käytä korkeampaa amplitudia
+        if pitch_x and x == pitch_x then
+          col_amp = vu_amp * 1.2  -- Vahvista pitch-saraketta
+        else
+          -- Muille sarakkeille pienempi amplitudi (taustakohina)
+          col_amp = vu_amp * 0.3
+        end
+        
+        col_amp = clamp(col_amp, 0, 1)
+        
+        if col_amp > 0.01 then
+          local lit_rows_for_col = math.max(1, round(col_amp * rows))
+          for i = 0, lit_rows_for_col - 1 do
             local y = rows - i
             if y >= 1 and y <= rows then
-              local brightness = clamp(4 + round(11 * (i / math.max(1, lit_rows - 1))), 4, 15)
+              local brightness = clamp(4 + round(11 * (i / math.max(1, lit_rows_for_col - 1))), 4, 15)
               g:led(x, y, brightness)
             end
           end
         end
-      else
-        local center_x = math.ceil(cols / 2)
-        for i = 0, lit_rows - 1 do
-          local y = rows - i
-          if y >= 1 and y <= rows then
-            local brightness = clamp(4 + round(11 * (i / math.max(1, lit_rows - 1))), 4, 15)
-            g:led(center_x, y, brightness)
-          end
-        end
       end
-    else
-      -- Ei signaalia: yksi himmeä rivi alhaalla (grid elää)
-      local y_bottom = rows
-      for x = 1, cols do
-        g:led(x, y_bottom, 1)
+      
+      -- Jos ei signaalia ollenkaan, näytä yksi himmeä rivi alhaalla
+      if vu_amp < 0.01 then
+        local y_bottom = rows
+        for x = 1, cols do
+          g:led(x, y_bottom, 1)
+        end
       end
     end
     
