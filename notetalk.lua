@@ -26,18 +26,38 @@ local state = {
   last_event_midi = nil,
   last_event_conf = 0,
   last_event_amp = 0,
-  amp_in = 0,
+  amp_out_l = 0,
+  amp_out_r = 0,
+  amp_in_l = 0,
+  amp_in_r = 0,
   pitch_hz = nil,
   pitch_conf = 0,
   amp_norm = 0,
+  amp_pulse = 0,
+  amp_floor_est = 0,
+  amp_ceil_est = 0.1,
   pitch_midi = nil,
   onset_event = false,
   now_ms = 0,
+  debug_hit_count = 0,
+  debug_last_trigger_ms = -10000,
+  voiced_pitch_last_ms = -10000,
+  phase_wrap_count = 0,
+  phase_event_count = 0,
+  phase_moving = false,
+  phase_last_t = 0,
+  phase_last_pos = nil,
+  phase_pulse_t = 0,
+  enc_shift = false,
 }
 
 local amp_poll = nil
+local amp_poll_aux = nil
+local amp_poll_in_l = nil
+local amp_poll_in_r = nil
 local pitch_poll = nil
 local conf_poll = nil
+local pitch_retry_metro = nil
 local analysis_clock = nil
 local redraw_clock = nil
 local grid_redraw_metro = nil
@@ -52,9 +72,83 @@ local active_line_t0 = nil
 local set_active_line_from_event = nil
 
 local LINE_FADE_MS = 500
-local DEBUG_SAMPLE_RELATIVE_PATH = "kantama/land is burning.wav"
+local DEBUG_SAMPLE_RELATIVE_PATH = "kantama/finland.wav"
+local DEBUG_RUN_ID = "grid-note-plan-v1"
 
 local SCALE_NAMES = Mapping.get_scale_names()
+local debug_last_log_at = {}
+local voiced_pitch_samples = {}
+local VOICED_PITCH_CAP = 9
+local GRID_RECOVER_TICKS = 120
+local grid_not_ready_ticks = 0
+local deferred_clocks = {}
+local ENABLE_PHASE_MONITOR = false
+local phase_monitor_active = false
+local softcut_active = false
+local ENABLE_DEBUG_AUTOSAMPLE = false
+local DEBUG_ENABLED = false
+
+-- Forward declarations used by load_sample/cleanup before definitions.
+local setup_softcut_phase_monitor
+local clear_softcut_phase_monitor
+
+local function defer_clock(fn)
+  local id = clock.run(fn)
+  table.insert(deferred_clocks, id)
+  return id
+end
+
+local function debug_json_escape(value)
+  local text = tostring(value or "")
+  text = text:gsub("\\", "\\\\"):gsub("\"", "\\\"")
+  text = text:gsub("\n", "\\n"):gsub("\r", "\\r")
+  return text
+end
+
+local function debug_json_kv(key, value)
+  local value_type = type(value)
+  if value_type == "number" or value_type == "boolean" then
+    return "\"" .. key .. "\":" .. tostring(value)
+  end
+  if value == nil then
+    return "\"" .. key .. "\":null"
+  end
+  return "\"" .. key .. "\":\"" .. debug_json_escape(value) .. "\""
+end
+
+local function debug_log(hypothesis_id, location, message, data)
+  if not DEBUG_ENABLED then
+    return
+  end
+  local payload_parts = {
+    debug_json_kv("runId", DEBUG_RUN_ID),
+    debug_json_kv("hypothesisId", hypothesis_id),
+    debug_json_kv("location", location),
+    debug_json_kv("message", message),
+    debug_json_kv("timestamp", os.time() * 1000),
+  }
+
+  if data then
+    local data_parts = {}
+    for key, value in pairs(data) do
+      data_parts[#data_parts + 1] = debug_json_kv(key, value)
+    end
+    payload_parts[#payload_parts + 1] = "\"data\":{" .. table.concat(data_parts, ",") .. "}"
+  end
+
+  local line = "{" .. table.concat(payload_parts, ",") .. "}"
+  print("NTDBG " .. line)
+end
+
+local function debug_should_log(key, min_interval_sec)
+  local now = util.time()
+  local last = debug_last_log_at[key] or 0
+  if (now - last) >= min_interval_sec then
+    debug_last_log_at[key] = now
+    return true
+  end
+  return false
+end
 
 local function clamp(value, min_value, max_value)
   return math.max(min_value, math.min(max_value, value))
@@ -65,6 +159,41 @@ local function round(value)
     return math.floor(value + 0.5)
   end
   return math.ceil(value - 0.5)
+end
+
+local function median_numbers(values)
+  if #values == 0 then
+    return nil
+  end
+  local sorted = {}
+  for i = 1, #values do
+    sorted[i] = values[i]
+  end
+  table.sort(sorted)
+  local center = math.floor(#sorted / 2)
+  if (#sorted % 2) == 1 then
+    return sorted[center + 1]
+  end
+  return (sorted[center] + sorted[center + 1]) * 0.5
+end
+
+local function push_voiced_pitch(hz, now_ms)
+  if not hz or hz <= 0 then
+    return
+  end
+  voiced_pitch_samples[#voiced_pitch_samples + 1] = hz
+  if #voiced_pitch_samples > VOICED_PITCH_CAP then
+    table.remove(voiced_pitch_samples, 1)
+  end
+  state.voiced_pitch_last_ms = now_ms or state.now_ms
+end
+
+local function recent_voiced_pitch(now_ms, max_age_ms)
+  local age_limit = max_age_ms or 700
+  if (#voiced_pitch_samples == 0) or ((now_ms - (state.voiced_pitch_last_ms or -10000)) > age_limit) then
+    return nil
+  end
+  return median_numbers(voiced_pitch_samples)
 end
 
 local function option_index(options, target)
@@ -173,9 +302,19 @@ local function apply_engine_settings()
 end
 
 local function setup_softcut_defaults()
+  pcall(function() audio.level_dac(1.0) end)
+  pcall(function() audio.level_monitor(1.0) end)
+  pcall(function() audio.level_monitor_mix(1.0) end)
+  pcall(function() audio.level_tape(1.0) end)
+  pcall(function() audio.level_cut(1.0) end)
   pcall(function() softcut.enable(1, 1) end)
   pcall(function() softcut.buffer(1, 1) end)
   pcall(function() softcut.level(1, 1) end)
+  pcall(function() softcut.level_input_cut(1, 1, 0) end)
+  pcall(function() softcut.level_input_cut(2, 1, 0) end)
+  pcall(function() softcut.rec_level(1, 0) end)
+  pcall(function() softcut.pre_level(1, 1) end)
+  pcall(function() softcut.rec(1, 0) end)
   pcall(function() softcut.pan(1, 0) end)
   pcall(function() softcut.rate(1, 1) end)
   pcall(function() softcut.loop(1, 1) end)
@@ -183,15 +322,18 @@ local function setup_softcut_defaults()
   pcall(function() softcut.loop_end(1, 4) end)
   pcall(function() softcut.position(1, 0) end)
   pcall(function() softcut.play(1, 0) end)
+  softcut_active = true
 end
 
-local function load_sample(path)
+local function load_sample(path, attempt)
   if not path or path == "" then
     return
   end
+  attempt = attempt or 1
 
-  local ok = pcall(function()
+  local ok, err = pcall(function()
     setup_softcut_defaults()
+    setup_softcut_phase_monitor()
     softcut.buffer_clear()
     softcut.buffer_read_mono(path, 0, 0, -1, 1, 1, 0)
     softcut.position(1, 0)
@@ -201,16 +343,97 @@ local function load_sample(path)
   if ok then
     state.sample_loaded = true
     state.sample_path = path
+    print("notetalk sample loaded: " .. path)
 
     local _, frames, sample_rate = audio.file_info(path)
     if frames and sample_rate and sample_rate > 0 then
       local duration = frames / sample_rate
       pcall(function() softcut.loop_end(1, math.max(0.2, duration)) end)
     end
+    -- Ensure playback is running after read starts.
+    defer_clock(function()
+      clock.sleep(0.1)
+      if state.freeze then return end
+      pcall(function() softcut.position(1, 0) end)
+      pcall(function() softcut.play(1, 1) end)
+    end)
+  else
+    state.sample_loaded = false
+    state.sample_path = nil
+    print(string.format("notetalk sample load failed (attempt %d): %s", attempt, tostring(err)))
+    if attempt < 2 then
+      defer_clock(function()
+        clock.sleep(0.2)
+        if state.freeze then return end
+        load_sample(path, attempt + 1)
+      end)
+    end
   end
 
   update_source_label()
   redraw()
+end
+
+local function play_boot_test_tone()
+  defer_clock(function()
+    clock.sleep(0.3)
+    if state.freeze then return end
+    pcall(function() engine.hz(440) end)
+    pcall(function() engine.amp(0.35) end)
+    clock.sleep(0.2)
+    if state.freeze then return end
+    pcall(function() engine.amp(0) end)
+  end)
+end
+
+setup_softcut_phase_monitor = function()
+  if not ENABLE_PHASE_MONITOR or phase_monitor_active then
+    return
+  end
+  pcall(function() softcut.phase_quant(1, 0.125) end)
+  pcall(function() softcut.poll_start_phase() end)
+  pcall(function()
+    softcut.event_phase(function(voice, position)
+      if voice ~= 1 then
+        return
+      end
+
+      local now_t = util.time()
+      state.phase_event_count = state.phase_event_count + 1
+      state.phase_moving = true
+      state.phase_last_t = now_t
+
+      local previous = state.phase_last_pos
+      if previous and position < (previous - 0.2) then
+        state.phase_wrap_count = state.phase_wrap_count + 1
+        state.phase_pulse_t = now_t
+        -- #region agent log
+        debug_log("H7", "notetalk.lua:softcut.event_phase", "phase_wrap", {
+          wraps = state.phase_wrap_count,
+          events = state.phase_event_count,
+          pos = position,
+          prev = previous,
+        })
+        -- #endregion
+      end
+      state.phase_last_pos = position
+    end)
+  end)
+  phase_monitor_active = true
+end
+
+clear_softcut_phase_monitor = function()
+  if not phase_monitor_active then
+    return
+  end
+  -- Set no-op first so no Lua callback runs during/after poll stop (avoids crone/JACK issues).
+  pcall(function()
+    softcut.event_phase(function(_, _) end)
+  end)
+  pcall(function()
+    softcut.poll_stop_phase()
+  end)
+  phase_monitor_active = false
 end
 
 local function unload_sample()
@@ -232,6 +455,29 @@ local function midi_note_from_event(event)
   return Mapping.clamp_midi(quantized, params:get("midi_min"), params:get("midi_max"))
 end
 
+local function stabilized_event_hz(event_hz, now_ms)
+  local hz = recent_voiced_pitch(now_ms, 700) or event_hz
+  if not hz or hz <= 0 then
+    return nil
+  end
+
+  local prev_hz = state.last_event_hz
+  if prev_hz and prev_hz > 0 then
+    local prev_midi = Mapping.hz_to_midi(prev_hz)
+    local current_midi = Mapping.hz_to_midi(hz)
+    if prev_midi and current_midi then
+      local max_jump = 7
+      local diff = current_midi - prev_midi
+      if math.abs(diff) > max_jump then
+        local clamped_midi = prev_midi + (diff > 0 and max_jump or -max_jump)
+        hz = musicutil.note_num_to_freq(clamped_midi)
+      end
+    end
+  end
+
+  return hz
+end
+
 local function trigger_synth(note, amp)
   if params:string("use_synth") ~= "on" then
     return
@@ -239,14 +485,17 @@ local function trigger_synth(note, amp)
 
   local hz = musicutil.note_num_to_freq(note)
   local level = clamp(amp or 0.2, 0, 1)
+  -- Keep triggers audible even when analysis amp is near threshold.
+  level = clamp((0.15 + (level * 0.85)) * params:get("synth_level"), 0, 1)
 
   pcall(function() engine.hz(hz) end)
 
   -- Prefer gated engines when available; otherwise trigger as one-shot.
   local ok_note_on = pcall(function() engine.noteOn(level) end)
   if ok_note_on then
-    clock.run(function()
+    defer_clock(function()
       clock.sleep(params:get("note_length_ms") / 1000)
+      if state.freeze then return end
       pcall(function() engine.noteOff() end)
     end)
   else
@@ -255,6 +504,11 @@ local function trigger_synth(note, amp)
 end
 
 local function handle_analysis_event(event)
+  local hz = stabilized_event_hz(event.hz, state.now_ms)
+  if not hz then
+    return
+  end
+  event.hz = hz
   state.onset_event = true
   set_active_line_from_event(event)
 
@@ -271,6 +525,16 @@ local function handle_analysis_event(event)
   midi_out:set_note_length_ms(params:get("note_length_ms"))
   midi_out:trigger_note(note, event.amp)
   trigger_synth(note, event.amp)
+  -- #region agent log
+  debug_log("H4", "notetalk.lua:handle_analysis_event", "triggered_note", {
+    note = note,
+    amp = event.amp or 0,
+    confidence = event.confidence or 0,
+    sample_mode = source_is_sample(),
+    synth_on = params:string("use_synth"),
+    synth_level = params:get("synth_level"),
+  })
+  -- #endregion
   redraw()
 end
 
@@ -286,36 +550,99 @@ local function setup_polls()
     return nil
   end
 
-  -- Prefer output-side analysis polls so softcut/sample source is visible.
-  local amp_poll_names = {"amp_out_l", "amp_in_l"}
-  for _, name in ipairs(amp_poll_names) do
-    amp_poll = try_poll(name, function(value) state.amp_in = math.abs(value or 0) end)
-    if amp_poll then
-      break
-    end
-  end
+  -- Read multiple amp taps and use whichever gives strongest signal.
+  amp_poll = try_poll("amp_out_l", function(value) state.amp_out_l = math.abs(value or 0) end)
+  amp_poll_aux = try_poll("amp_out_r", function(value) state.amp_out_r = math.abs(value or 0) end)
+  amp_poll_in_l = try_poll("amp_in_l", function(value) state.amp_in_l = math.abs(value or 0) end)
+  amp_poll_in_r = try_poll("amp_in_r", function(value) state.amp_in_r = math.abs(value or 0) end)
 
+  local pitch_poll_name = "none"
+  local conf_poll_name = "none"
   local pitch_poll_names = {"pitch_in", "pitch_out"}
-  for _, name in ipairs(pitch_poll_names) do
-    pitch_poll = try_poll(name, function(value) state.pitch_hz = value end)
-    if pitch_poll then
-      break
+  local conf_poll_names = {"pitch_conf", "pitch_out_conf"}
+
+  local function try_setup_pitch_and_conf()
+    if not pitch_poll then
+      for _, name in ipairs(pitch_poll_names) do
+        pitch_poll = try_poll(name, function(value) state.pitch_hz = value end)
+        if pitch_poll then
+          pitch_poll_name = name
+          break
+        end
+      end
+    end
+
+    if not conf_poll then
+      for _, name in ipairs(conf_poll_names) do
+        conf_poll = try_poll(name, function(value) state.pitch_conf = value end)
+        if conf_poll then
+          conf_poll_name = name
+          break
+        end
+      end
     end
   end
 
-  local conf_poll_names = {"pitch_conf", "pitch_out_conf"}
-  for _, name in ipairs(conf_poll_names) do
-    conf_poll = try_poll(name, function(value) state.pitch_conf = value end)
-    if conf_poll then
-      break
+  try_setup_pitch_and_conf()
+
+  -- #region agent log
+  debug_log("H6", "notetalk.lua:setup_polls", "poll_selection", {
+    amp_out_l = (amp_poll and "set" or "none"),
+    amp_out_r = (amp_poll_aux and "set" or "none"),
+    amp_in_l = (amp_poll_in_l and "set" or "none"),
+    amp_in_r = (amp_poll_in_r and "set" or "none"),
+    pitch_poll = pitch_poll_name,
+    conf_poll = conf_poll_name,
+  })
+  -- #endregion
+
+  if (not pitch_poll) or (not conf_poll) then
+    if pitch_retry_metro then
+      pitch_retry_metro:stop()
+      pitch_retry_metro = nil
     end
+    pitch_retry_metro = metro.init()
+    pitch_retry_metro.time = 1
+    pitch_retry_metro.event = function()
+      local had_pitch = (pitch_poll ~= nil)
+      local had_conf = (conf_poll ~= nil)
+      try_setup_pitch_and_conf()
+      local has_pitch = (pitch_poll ~= nil)
+      local has_conf = (conf_poll ~= nil)
+      if (had_pitch ~= has_pitch) or (had_conf ~= has_conf) or debug_should_log("poll_retry", 4.0) then
+        -- #region agent log
+        debug_log("H6", "notetalk.lua:setup_polls", "poll_retry_status", {
+          pitch_poll = pitch_poll_name,
+          conf_poll = conf_poll_name,
+          has_pitch = has_pitch,
+          has_conf = has_conf,
+        })
+        -- #endregion
+      end
+      if has_pitch and has_conf and pitch_retry_metro then
+        pitch_retry_metro:stop()
+        pitch_retry_metro = nil
+      end
+    end
+    pitch_retry_metro:start()
   end
 end
 
 local function cleanup_polls()
   if amp_poll then amp_poll:stop() end
+  if amp_poll_aux then amp_poll_aux:stop() end
+  if amp_poll_in_l then amp_poll_in_l:stop() end
+  if amp_poll_in_r then amp_poll_in_r:stop() end
   if pitch_poll then pitch_poll:stop() end
   if conf_poll then conf_poll:stop() end
+  if pitch_retry_metro then pitch_retry_metro:stop() end
+  amp_poll = nil
+  amp_poll_aux = nil
+  amp_poll_in_l = nil
+  amp_poll_in_r = nil
+  pitch_poll = nil
+  conf_poll = nil
+  pitch_retry_metro = nil
 end
 
 local function add_input_params()
@@ -339,6 +666,11 @@ local function add_input_params()
 
   params:add_trigger("clear_sample", "Clear Sample")
   params:set_action("clear_sample", function() unload_sample() end)
+
+  params:add_control("sample_level", "Sample Level", controlspec.new(0, 1, "lin", 0, 1.0, ""))
+  params:set_action("sample_level", function(value)
+    pcall(function() softcut.level(1, value) end)
+  end)
 end
 
 local function add_analysis_params()
@@ -375,7 +707,7 @@ end
 
 local function add_midi_params()
   params:add_separator("midi_sep", "MIDI Output")
-  params:add_option("midi_send", "Send MIDI", {"off", "on"}, 2)
+  params:add_option("midi_send", "Send MIDI", {"off", "on"}, 1)
   params:set_action("midi_send", function(value)
     midi_out:set_send_enabled(value == 2)
   end)
@@ -471,12 +803,22 @@ local function setup_debug_sample_defaults()
   params:set("sample_enabled", option_index({"off", "on"}, "on"))
   params:set("use_synth", option_index({"off", "on"}, "on"))
   params:set("midi_send", option_index({"off", "on"}, "off"))
-  params:set("threshold", 0.02)
+  params:set("threshold", 0.01)
   params:set("min_conf", 0.2)
   params:set("window_ms", 140)
   params:set("note_length_ms", 180)
+  params:set("sample_level", 1.0)
+  params:set("synth_level", 0.8)
 
   load_sample(debug_path)
+  -- #region agent log
+  debug_log("H5", "notetalk.lua:setup_debug_sample_defaults", "debug_defaults_applied", {
+    input_mode = params:string("input_mode"),
+    sample_enabled = params:string("sample_enabled"),
+    sample_level = params:get("sample_level"),
+    synth_level = params:get("synth_level"),
+  })
+  -- #endregion
 end
 
 local function update_grid_dimensions()
@@ -525,8 +867,47 @@ end
 local function grid_redraw()
   update_grid_dimensions()
   if not grid_is_ready() then
+    grid_not_ready_ticks = grid_not_ready_ticks + 1
+    local grid_ports = (grid.vports and #grid.vports) or 0
+    if debug_should_log("grid_not_ready", 2.0) then
+      -- #region agent log
+      debug_log("H1", "notetalk.lua:grid_redraw", "grid_not_ready", {
+        cols = grid_cols,
+        rows = grid_rows,
+        grid_connected = (g ~= nil),
+        not_ready_ticks = grid_not_ready_ticks,
+        grid_ports = grid_ports,
+      })
+      -- #endregion
+    end
+    if g ~= nil and (grid_not_ready_ticks % GRID_RECOVER_TICKS) == 0 then
+      -- #region agent log
+      debug_log("H1", "notetalk.lua:grid_redraw", "grid_reconnect_attempt", {
+        not_ready_ticks = grid_not_ready_ticks,
+        grid_ports = grid_ports,
+      })
+      -- #endregion
+      g = nil
+      g = grid.connect(1)
+      update_grid_dimensions()
+      if grid_is_ready() then
+        apply_grid_defaults_for_size(grid_cols, grid_rows)
+        grid_not_ready_ticks = 0
+        last_valid_x = nil
+        onset_x = nil
+        active_line_y = nil
+        active_line_t0 = nil
+        -- #region agent log
+        debug_log("H1", "notetalk.lua:grid_redraw", "grid_reconnect_success", {
+          cols = grid_cols,
+          rows = grid_rows,
+        })
+        -- #endregion
+      end
+    end
     return
   end
+  grid_not_ready_ticks = 0
 
   g:all(0)
 
@@ -551,6 +932,19 @@ local function grid_redraw()
 
   local lit = amp_to_lit_rows(amp_norm, vu_floor, grid_rows)
   local vu_mode = params:string("vu_mode")
+  if debug_should_log("grid_ready_state", 2.0) then
+    -- #region agent log
+    debug_log("H2", "notetalk.lua:grid_redraw", "grid_ready_state", {
+      lit = lit,
+      amp_norm = amp_norm,
+      pitch_conf = pitch_conf,
+      min_conf = min_conf,
+      current_x = current_x or -1,
+      rows = grid_rows,
+      cols = grid_cols,
+    })
+    -- #endregion
+  end
 
   if lit > 0 then
     if vu_mode == "wide" then
@@ -566,6 +960,11 @@ local function grid_redraw()
       local y = grid_rows - i
       g:led(current_x, y, 10)
     end
+  end
+
+  local heartbeat_on = (math.floor(util.time() * 2) % 2) == 0
+  if heartbeat_on then
+    g:led(1, 1, 2)
   end
 
   if active_line_y and active_line_t0 then
@@ -588,8 +987,16 @@ local function grid_redraw()
 end
 
 local function setup_grid()
-  g = grid.connect()
+  g = grid.connect(1)
   update_grid_dimensions()
+  grid_not_ready_ticks = 0
+  -- #region agent log
+  debug_log("H1", "notetalk.lua:setup_grid", "grid_connect", {
+    cols = grid_cols,
+    rows = grid_rows,
+    grid_connected = (g ~= nil),
+  })
+  -- #endregion
   if grid_is_ready() then
     apply_grid_defaults_for_size(grid_cols, grid_rows)
   end
@@ -599,8 +1006,9 @@ local function setup_grid()
   end
 
   grid.add = function()
-    g = grid.connect()
+    g = grid.connect(1)
     update_grid_dimensions()
+    grid_not_ready_ticks = 0
     if grid_is_ready() then
       apply_grid_defaults_for_size(grid_cols, grid_rows)
       last_valid_x = nil
@@ -616,6 +1024,7 @@ local function setup_grid()
       g = nil
       grid_cols = 0
       grid_rows = 0
+      grid_not_ready_ticks = 0
       last_valid_x = nil
       onset_x = nil
       active_line_y = nil
@@ -630,6 +1039,8 @@ local function setup_grid()
 end
 
 local function analyzer_loop()
+  local previous_amp = 0
+
   while true do
     clock.sleep(1 / 60)
     state.now_ms = state.now_ms + (1000 / 60)
@@ -641,16 +1052,160 @@ local function analyzer_loop()
 
     update_source_label()
 
-    local amp = clamp(state.amp_in or 0, 0, 1)
+    local sample_mode = source_is_sample()
+    local amp_raw = 0
+    if sample_mode then
+      -- Prefer input taps, but blend output taps lightly to avoid near-silence
+      -- on devices where amp_in polls sit close to the noise floor.
+      amp_raw = math.max(
+        state.amp_in_l or 0,
+        state.amp_in_r or 0,
+        (state.amp_out_l or 0) * 0.35,
+        (state.amp_out_r or 0) * 0.35
+      )
+    else
+      amp_raw = math.max(
+        state.amp_out_l or 0,
+        state.amp_out_r or 0,
+        state.amp_in_l or 0,
+        state.amp_in_r or 0
+      )
+    end
+    local amp = clamp(amp_raw, 0, 1)
     local pitch = state.pitch_hz
     local confidence = clamp(state.pitch_conf or 0, 0, 1)
-    state.amp_norm = amp
-    state.pitch_midi = current_pitch_midi()
-    local event = analyzer:process_observation(amp, pitch, confidence, state.now_ms)
-
-    if event then
-      handle_analysis_event(event)
+    local min_conf = params:get("min_conf")
+    if pitch and pitch > 0 and confidence >= min_conf then
+      push_voiced_pitch(pitch, state.now_ms)
     end
+
+    local amp_trigger_metric = amp
+    if sample_mode then
+      -- Adaptive normalization for more expressive fallback pitch mapping.
+      state.amp_floor_est = (state.amp_floor_est * 0.995) + (amp * 0.005)
+      state.amp_ceil_est = math.max(amp, state.amp_ceil_est * 0.998)
+      local span_for_amp = math.max(0.00001, state.amp_ceil_est - state.amp_floor_est)
+      amp = clamp((amp - state.amp_floor_est) / span_for_amp, 0, 1)
+      amp_trigger_metric = amp
+    else
+      amp_trigger_metric = amp
+    end
+
+    if sample_mode and (pitch == nil or pitch <= 0 or confidence < min_conf) then
+      -- Fallback pitch: map current amplitude to MIDI range (more expressive than fixed pitch).
+      pitch = recent_voiced_pitch(state.now_ms, 700)
+      if not pitch then
+        local midi_min = params:get("midi_min")
+        local midi_max = params:get("midi_max")
+        local amp_norm_pitch = clamp(amp, 0, 1)
+        local amp_midi = midi_min + round(amp_norm_pitch * (midi_max - midi_min))
+        pitch = musicutil.note_num_to_freq(clamp(amp_midi, midi_min, midi_max))
+      end
+      confidence = 1
+    end
+
+    state.amp_pulse = state.amp_pulse * 0.9
+    state.amp_norm = math.max(amp, state.amp_pulse)
+    state.pitch_midi = current_pitch_midi()
+
+    -- Sample-mode trigger from transients, not fixed clock.
+    local threshold = params:get("threshold")
+    local effective_threshold = threshold
+    if sample_mode then
+      effective_threshold = clamp(threshold, 0.003, 0.08)
+      if debug_should_log("threshold_guard", 2.0) then
+        -- #region agent log
+        debug_log("H11", "notetalk.lua:analyzer_loop", "threshold_guard", {
+          threshold_user = threshold,
+          threshold_effective = effective_threshold,
+          sample_mode = sample_mode,
+        })
+        -- #endregion
+      end
+    end
+    local amp_delta = amp_trigger_metric - previous_amp
+    local onset_candidate = amp_trigger_metric >= effective_threshold
+    local onset_rise_ok = amp_delta >= 0.004
+    local refractory_ok = (state.now_ms - state.debug_last_trigger_ms) >= params:get("hold_ms")
+    local onset_accept = onset_candidate and onset_rise_ok and refractory_ok
+    if debug_should_log("onset_stage", 1.0) then
+      -- #region agent log
+      debug_log("H3", "notetalk.lua:analyzer_loop", "onset_stage", {
+        onset_candidate = onset_candidate,
+        onset_rise_ok = onset_rise_ok,
+        refractory_ok = refractory_ok,
+        onset_accept = onset_accept,
+        amp_delta = amp_delta,
+        amp = amp,
+        amp_trigger_metric = amp_trigger_metric,
+        amp_prev = previous_amp,
+        threshold = effective_threshold,
+        sample_mode = sample_mode,
+        hold_ms = params:get("hold_ms"),
+      })
+      -- #endregion
+    end
+    if onset_accept then
+      -- #region agent log
+      debug_log("H3", "notetalk.lua:analyzer_loop", "trigger_branch", {
+        threshold_cross = onset_candidate,
+        amp_rise_trigger = onset_rise_ok,
+        recovery_trigger = false,
+        amp = amp,
+        amp_trigger_metric = amp_trigger_metric,
+        amp_prev = previous_amp,
+        threshold = effective_threshold,
+        sample_mode = sample_mode,
+        hold_ms = params:get("hold_ms"),
+      })
+      -- #endregion
+      state.debug_hit_count = state.debug_hit_count + 1
+      state.debug_last_trigger_ms = state.now_ms
+      local trigger_amp = clamp(math.max(amp_trigger_metric, effective_threshold * 1.2), 0, 1)
+      state.amp_pulse = math.max(state.amp_pulse, trigger_amp)
+      -- #region agent log
+      debug_log("H8", "notetalk.lua:analyzer_loop", "fallback_event_emit", {
+        trigger_amp = trigger_amp,
+        hz = (pitch and pitch > 0) and pitch or 220,
+        confidence = (confidence and confidence > 0) and confidence or 1,
+        threshold_cross = onset_candidate,
+        amp_rise_trigger = onset_rise_ok,
+      })
+      -- #endregion
+      handle_analysis_event({
+        hz = (pitch and pitch > 0) and pitch or 220,
+        confidence = (confidence and confidence > 0) and confidence or 1,
+        amp = trigger_amp,
+      })
+    end
+    if debug_should_log("analyzer_summary", 2.0) then
+      -- #region agent log
+      debug_log("H2", "notetalk.lua:analyzer_loop", "analyzer_summary", {
+        amp = amp,
+        amp_trigger_metric = amp_trigger_metric,
+        amp_raw = amp_raw,
+        amp_floor_est = state.amp_floor_est,
+        amp_ceil_est = state.amp_ceil_est,
+        amp_out_l = state.amp_out_l or 0,
+        amp_out_r = state.amp_out_r or 0,
+        amp_in_l = state.amp_in_l or 0,
+        amp_in_r = state.amp_in_r or 0,
+        amp_prev = previous_amp,
+        pitch_hz = pitch or -1,
+        conf = confidence,
+        hit_count = state.debug_hit_count,
+        sample_mode = sample_mode,
+        input_mode = params:string("input_mode"),
+        sample_enabled = params:string("sample_enabled"),
+        sample_loaded = state.sample_loaded,
+        threshold = effective_threshold,
+        threshold_user = threshold,
+      })
+      -- #endregion
+    end
+    previous_amp = amp_trigger_metric
+
+    analyzer:process_observation(amp, pitch, confidence, state.now_ms)
 
     ::continue::
   end
@@ -664,6 +1219,18 @@ local function redraw_loop()
 end
 
 function init()
+  if grid_redraw_metro then
+    grid_redraw_metro:stop()
+    grid_redraw_metro = nil
+  end
+  if analysis_clock then
+    clock.cancel(analysis_clock)
+    analysis_clock = nil
+  end
+  if redraw_clock then
+    clock.cancel(redraw_clock)
+    redraw_clock = nil
+  end
   analyzer = Analyzer.new({
     threshold = 0.05,
     min_conf = 0.45,
@@ -672,13 +1239,17 @@ function init()
   })
   midi_out = MidiOut.new()
 
+  -- Keep softcut defaults ready at init time (without phase polling) to avoid racey first-load failures.
   setup_softcut_defaults()
   setup_params()
   setup_polls()
   setup_grid()
-  setup_debug_sample_defaults()
+  if ENABLE_DEBUG_AUTOSAMPLE then
+    setup_debug_sample_defaults()
+  end
   update_source_label()
   apply_engine_settings()
+  play_boot_test_tone()
 
   analysis_clock = clock.run(analyzer_loop)
   redraw_clock = clock.run(redraw_loop)
@@ -686,32 +1257,44 @@ function init()
 end
 
 function enc(n, d)
-  if n == 1 then
-    params:set("threshold", clamp(params:get("threshold") + d * 0.0025, 0.001, 1))
-  elseif n == 2 then
-    params:set("min_conf", clamp(params:get("min_conf") + d * 0.01, 0, 1))
-  elseif n == 3 then
-    local current = params:get("scale")
-    local next_index = clamp(current + d, 1, #SCALE_NAMES)
-    params:set("scale", next_index)
+  if state.enc_shift then
+    if n == 1 then
+      params:set("threshold", clamp(params:get("threshold") + d * 0.0025, 0.001, 1))
+    elseif n == 2 then
+      params:set("min_conf", clamp(params:get("min_conf") + d * 0.01, 0, 1))
+    elseif n == 3 then
+      local current = params:get("scale")
+      local next_index = clamp(current + d, 1, #SCALE_NAMES)
+      params:set("scale", next_index)
+    end
+  else
+    if n == 1 then
+      params:set("threshold", clamp(params:get("threshold") + d * 0.0025, 0.001, 1))
+    elseif n == 2 then
+      params:set("sample_level", clamp(params:get("sample_level") + d * 0.01, 0, 1))
+    elseif n == 3 then
+      params:set("synth_level", clamp(params:get("synth_level") + d * 0.01, 0, 1))
+    end
   end
   redraw()
 end
 
 function key(n, z)
-  if z == 0 then
-    return
+  if n == 1 then
+    state.enc_shift = (z == 1)
   end
 
-  if n == 2 then
-    state.freeze = not state.freeze
-  elseif n == 3 then
-    local test_event = {
-      hz = 440,
-      confidence = 1,
-      amp = clamp(params:get("threshold") * 1.5, 0.05, 1),
-    }
-    handle_analysis_event(test_event)
+  if z == 1 then
+    if n == 2 then
+      state.freeze = not state.freeze
+    elseif n == 3 then
+      local test_event = {
+        hz = 440,
+        confidence = 1,
+        amp = clamp(params:get("threshold") * 1.5, 0.05, 1),
+      }
+      handle_analysis_event(test_event)
+    end
   end
   redraw()
 end
@@ -738,17 +1321,72 @@ function redraw()
   screen.text("scale:" .. current_scale_name())
 
   screen.move(0, 60)
+  local last_text = "last:none"
   if state.last_event_midi then
-    screen.text(string.format("last n%d %.2f", state.last_event_midi, state.last_event_conf))
-  else
-    screen.text("last: none")
+    last_text = string.format("last:n%d", state.last_event_midi)
   end
+  screen.text(string.format("%s h:%d", last_text, state.debug_hit_count))
+
+  -- Right-edge 1px volume meters: sample (left) and note/synth (right).
+  local meter_bottom = 63
+  local meter_top = 0
+  local meter_height = 64
+  local sample_level = clamp(params:get("sample_level") or 0, 0, 1)
+  local synth_level = clamp(params:get("synth_level") or 0, 0, 1)
+  local sample_pixels = clamp(round(sample_level * meter_height), 0, meter_height)
+  local synth_pixels = clamp(round(synth_level * meter_height), 0, meter_height)
+
+  -- Dim rails (always visible), then bright filled amount.
+  screen.level(2)
+  screen.move(125, meter_top)
+  screen.line(125, meter_bottom)
+  screen.stroke()
+  screen.move(127, meter_top)
+  screen.line(127, meter_bottom)
+  screen.stroke()
+
+  screen.level(15)
+  if sample_pixels > 0 then
+    screen.move(125, meter_bottom)
+    screen.line(125, meter_bottom - sample_pixels + 1)
+    screen.stroke()
+  end
+  if synth_pixels > 0 then
+    screen.move(127, meter_bottom)
+    screen.line(127, meter_bottom - synth_pixels + 1)
+    screen.stroke()
+  end
+
   screen.update()
 end
 
 function cleanup()
+  -- Ultra-safe shutdown: cancel local callbacks/timers only, avoid backend audio calls during global restart.
+  state.freeze = true
+  for _, id in ipairs(deferred_clocks) do
+    pcall(clock.cancel, id)
+  end
+  deferred_clocks = {}
   cleanup_polls()
+  clear_softcut_phase_monitor()
+  softcut_active = false
+  state.amp_norm = 0
+  state.amp_pulse = 0
+  state.pitch_hz = nil
+  state.pitch_conf = 0
+  state.pitch_midi = nil
+  state.debug_last_trigger_ms = -10000
+  state.voiced_pitch_last_ms = -10000
+  voiced_pitch_samples = {}
+  grid_not_ready_ticks = 0
+  last_valid_x = nil
+  onset_x = nil
+  active_line_y = nil
+  active_line_t0 = nil
   if grid_redraw_metro then grid_redraw_metro:stop() end
   if analysis_clock then clock.cancel(analysis_clock) end
   if redraw_clock then clock.cancel(redraw_clock) end
+  grid_redraw_metro = nil
+  analysis_clock = nil
+  redraw_clock = nil
 end

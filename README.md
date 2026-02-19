@@ -100,12 +100,43 @@ In `column` mode:
 
 - only the current pitch column is shown
 
+## One-Command Deploy + Run
+
+Use:
+
+```bash
+./loitsu.sh
+```
+
+Optional host:
+
+```bash
+./loitsu.sh 192.168.1.123
+```
+
+This command rsyncs the project to `/home/we/dust/code/notetalk/` and then tries to auto-load the script.
+If REPL CLI tools are unavailable, it falls back gracefully and asks you to run from Norns UI.
+
 ## Files
 
 - `notetalk.lua`: main script, params, UI, loop logic
 - `lib/analyzer.lua`: analysis chain and event detection
 - `lib/mapping.lua`: pitch-to-note mapping and quantization
 - `lib/midi_out.lua`: MIDI sending and note timing
+
+## Restart / Recovery
+
+If **SYSTEM > RESTART** gets stuck on “restarting” (Norns services sometimes start in an order where crone runs before JACK is ready), recover from another machine:
+
+```bash
+ssh we@norns.local
+sudo systemctl stop norns-matron norns-sclang norns-crone
+sudo systemctl restart norns-jack
+sleep 2
+sudo systemctl start norns-crone norns-sclang norns-matron
+```
+
+Then refresh the Norns UI; the script can be reloaded as usual.
 
 ## Notes
 

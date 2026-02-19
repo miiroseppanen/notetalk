@@ -73,20 +73,36 @@ function MidiOut:trigger_note(note, amp)
     return
   end
 
+  local send_fn = self.conn.send
+  if type(send_fn) ~= "function" then
+    return
+  end
+
   local midi_note = clamp(round(note), 0, 127)
+  local channel = clamp(round(tonumber(self.channel) or 1), 1, 16)
   local velocity = self.fixed_velocity
   if self.velocity_mode == "amp" then
     velocity = self:velocity_from_amp(amp)
   end
 
-  local message_on = midi.to_msg({type = "note_on", ch = self.channel, note = midi_note, vel = velocity})
-  local message_off = midi.to_msg({type = "note_off", ch = self.channel, note = midi_note, vel = 0})
+  local message_on = midi.to_msg({type = "note_on", ch = channel, note = midi_note, vel = velocity})
+  local message_off = midi.to_msg({type = "note_off", ch = channel, note = midi_note, vel = 0})
+  if message_on == nil or message_off == nil then
+    return
+  end
 
-  self.conn:send(message_on)
+  local ok_on = pcall(function()
+    self.conn:send(message_on)
+  end)
+  if not ok_on then
+    return
+  end
   clock.run(function()
     clock.sleep(self.note_length_ms / 1000)
     if self.conn then
-      self.conn:send(message_off)
+      pcall(function()
+        self.conn:send(message_off)
+      end)
     end
   end)
 end
