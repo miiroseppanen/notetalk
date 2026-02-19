@@ -12,8 +12,8 @@ end
 function VUAnalyzer.new(opts)
   local self = setmetatable({}, VUAnalyzer)
   self.state = opts.state
-  self.vu_decay = opts.vu_decay or 0.99
-  self.amp_for_vu_alpha = opts.amp_for_vu_alpha or 0.12
+  self.vu_decay = opts.vu_decay or 0.96
+  self.amp_for_vu_alpha = opts.amp_for_vu_alpha or 0.28
   self.vu_gain = opts.vu_gain or 15
   return self
 end

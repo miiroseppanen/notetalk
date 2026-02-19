@@ -152,8 +152,8 @@ function GridVisualizer:draw()
       if pitch_midi_grid and pitch_midi_grid >= pitch_min and pitch_midi_grid <= pitch_max then
         pitch_x = pitch_to_x(pitch_midi_grid, cols, pitch_min, pitch_max)
       end
-      local decay = sample_mode and 0.46 or 0.91   -- hyvin nopea putoaminen = maksimaalinen responsiivisuus
-      local rise_speed = sample_mode and 1.0 or 0.28  -- nousu täysin välitön
+      local decay = sample_mode and 0.46 or 0.70   -- nopea putoaminen, erityisesti line-in
+      local rise_speed = sample_mode and 1.0 or 0.55  -- nopeampi lasku line-in
       local spread_radius = math.max(2, math.floor(cols * 0.35))
       local spread_inv = 1 / (spread_radius + 1)
       for x = 1, cols do

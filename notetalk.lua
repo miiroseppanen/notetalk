@@ -101,6 +101,7 @@ local state = {
   grid_col_display = {}, -- per-sarake: näytetty taso (smooth rise)
   -- Norns engine can return nil on later lookup; store refs when engine loads (see init).
   synth_engine = nil,  -- { hz, amp, level, noteOn, noteOff } when loaded
+  engine_ready = false,  -- true after init_engine has loaded and verified engine (K3 test waits for this)
 }
 
 local analysis_clock = nil
@@ -896,6 +897,7 @@ function init()
 
   synth_service:init_engine(function(engine_loaded)
     if engine_loaded then
+      state.engine_ready = true
       analysis_clock = clock.run(analyzer_loop)
     end
     redraw()
@@ -942,6 +944,11 @@ function key(n, z)
     if n == 2 then
       state.freeze = not state.freeze
     elseif n == 3 then
+      if not state.engine_ready then
+        print("notetalk: wait for engine")
+        redraw()
+        return
+      end
       local test_event = {
         hz = 440,
         confidence = 1,

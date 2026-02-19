@@ -18,7 +18,17 @@ Syncs to `/home/we/dust/code/notetalk/`. If auto-load fails, run script from Nor
 
 ## Files
 
-`notetalk.lua` (main), `lib/` — `analyzer`, `audio_service`, `grid_visualizer`, `mapping`, `midi_out`, `onset_service`, `pitch_service`.
+- **notetalk.lua** — main script (orchestration, state, params, screen).
+- **lib/** — one module per concern:
+  - **audio_input** — amp + pitch polls, health check and restart.
+  - **audio_output** — DAC/cut/engine levels.
+  - **audio_service** — softcut, sample load, routing.
+  - **vu_analyzer** — VU level, normalization (sample mode), amp_norm/amp_for_vu.
+  - **pitch_service** — continuous pitch (100 ms grid).
+  - **onset_service** — stab/onset detection.
+  - **synth_service** — Norns engine trigger, deferred init, boot tone.
+  - **grid_controller** — grid connect; wraps **grid_visualizer** (VU/pitch on grid).
+  - **analyzer** — observation processing; **mapping** — scales, hz→midi; **midi_out** — MIDI note output.
 
 ## If something breaks
 

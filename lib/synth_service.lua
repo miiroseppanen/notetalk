@@ -86,11 +86,33 @@ function SynthService:trigger_note(note, amp)
       state.synth_engine = { hz = h, amp = a, level = l, noteOn = engine.noteOn, noteOff = engine.noteOff }
     end
   end
+  if not state.synth_engine then
+    print("notetalk: SYNTH skip (engine not loaded)")
+    return
+  end
 
   local eng = state.synth_engine
-  if eng and eng.level then pcall(eng.level, level) else pcall(function() engine.level(level) end) end
-  if eng and eng.amp then pcall(eng.amp, level) else pcall(function() engine.amp(level) end) end
-  if eng and eng.hz then pcall(eng.hz, hz) else pcall(function() engine.hz(hz) end) end
+  local ok_l, err_l = true
+  local ok_a, err_a = true
+  local ok_h, err_h = true
+  if eng and eng.level then
+    ok_l, err_l = pcall(eng.level, level)
+  else
+    ok_l, err_l = pcall(function() engine.level(level) end)
+  end
+  if eng and eng.amp then
+    ok_a, err_a = pcall(eng.amp, level)
+  else
+    ok_a, err_a = pcall(function() engine.amp(level) end)
+  end
+  if eng and eng.hz then
+    ok_h, err_h = pcall(eng.hz, hz)
+  else
+    ok_h, err_h = pcall(function() engine.hz(hz) end)
+  end
+  if not ok_l then print("notetalk: SYNTH engine.level failed: " .. tostring(err_l)) end
+  if not ok_a then print("notetalk: SYNTH engine.amp failed: " .. tostring(err_a)) end
+  if not ok_h then print("notetalk: SYNTH engine.hz failed: " .. tostring(err_h)) end
 
   local ok_note_on = false
   if eng and eng.noteOn and type(eng.noteOn) == "function" then
@@ -137,6 +159,14 @@ function SynthService:init_engine(on_engine_ready)
       noteOn = engine.noteOn,
       noteOff = engine.noteOff,
     }
+    local eng = state.synth_engine
+    local ok_hz, err_hz = pcall(eng.hz, 440)
+    local ok_amp, err_amp = pcall(eng.amp, 0.35)
+    if not ok_hz or not ok_amp then
+      print("notetalk: SYNTH ref test failed - hz:" .. tostring(err_hz) .. " amp:" .. tostring(err_amp))
+      state.synth_engine = nil
+      return false
+    end
     local noteOn_fn = engine.noteOn
     local noteOff_fn = engine.noteOff
     local hz_fn = engine.hz
