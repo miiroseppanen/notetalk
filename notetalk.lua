@@ -907,8 +907,9 @@ end
 local function draw_grid()
   if not g then return end
   
-  local cols = grid_cols or g.cols or 16
-  local rows = grid_rows or g.rows or 8
+  -- Varmista että käytämme koko gridin leveyttä (16x8 kahdelle Launchpadille)
+  local cols = math.max(grid_cols or g.cols or 16, 16)
+  local rows = math.max(grid_rows or g.rows or 8, 8)
   if cols < 1 or rows < 1 then return end
   
   local ok, err = pcall(function()
@@ -1033,9 +1034,31 @@ local function setup_grid()
   end
   
   if g then
-    grid_cols = (g.cols and g.cols > 0) and g.cols or 16
-    grid_rows = (g.rows and g.rows > 0) and g.rows or 8
+    -- Midigrid kahdella Launchpadilla: käytä koko 16x8 gridiä
+    -- Midigrid raportoi 8x8 per Launchpad, mutta meidän pitää käyttää koko 16x8
+    local reported_cols = g.cols or 0
+    local reported_rows = g.rows or 0
     
+    -- Jos dimensiot ovat 8x8, oletetaan että on kaksi Launchpadia yhdistettynä
+    -- Pakota 16x8 jotta käytämme koko gridin leveyttä
+    if reported_cols == 8 and reported_rows == 8 then
+      grid_cols = 16  -- Kaksi Launchpadia vaakasuunnassa = 16 saraketta
+      grid_rows = 8
+    elseif reported_cols >= 16 then
+      -- Jos grid raportoi jo 16+, käytä sitä
+      grid_cols = reported_cols
+      grid_rows = reported_rows
+    else
+      -- Oletus: pakota 16x8
+      grid_cols = 16
+      grid_rows = 8
+    end
+    
+    -- Varmista että käytämme koko gridin leveyttä
+    grid_cols = math.max(grid_cols, 16)
+    grid_rows = math.max(grid_rows, 8)
+    
+    -- Pakota dimensiot grid-olioon
     if g.cols then g.cols = grid_cols end
     if g.rows then g.rows = grid_rows end
     
