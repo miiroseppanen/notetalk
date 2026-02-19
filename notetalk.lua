@@ -917,13 +917,34 @@ local function draw_grid()
       vu_mode = params:string("vu_mode") or vu_mode
     end)
     
-    -- VU-mittari: käytä hitaasti decaytaavaa tasoa
-    local vu_amp = clamp(state.vu_level or 0, 0, 1)
+    -- VU-mittari: käytä suoraan poll-arvoja tai vu_level
+    local sample_mode = source_is_sample()
+    local direct_amp = 0
+    if sample_mode then
+      direct_amp = math.max(state.amp_out_l or 0, state.amp_out_r or 0)
+    else
+      direct_amp = math.max(state.amp_in_l or 0, state.amp_in_r or 0)
+    end
+    
+    -- Käytä vu_level:ia jos se on suurempi, muuten käytä suoraa poll-arvoa vahvistettuna
+    local vu_from_level = clamp(state.vu_level or 0, 0, 1)
+    local vu_from_polls = math.min(1, direct_amp * 50)  -- Erittäin vahva vahvistus
+    local vu_amp = math.max(vu_from_level, vu_from_polls)
+    
+    -- TESTI: jos kaikki on 0, näytä silti pieni VU testinä
+    if vu_amp < 0.01 and (state.amp_out_l or 0) + (state.amp_out_r or 0) + (state.amp_in_l or 0) + (state.amp_in_r or 0) == 0 then
+      -- Jos ei signaalia ollenkaan, näytä silti pieni testi-VU (1 rivi) jotta nähdään että grid toimii
+      vu_amp = 0.1  -- Testi: näytä 1 rivi
+    end
+    
     local lit_rows = 0
     
-    if vu_amp > vu_floor * 0.5 then
-      local vu_range = clamp((vu_amp - vu_floor * 0.5) / (1 - vu_floor * 0.5), 0, 1)
-      lit_rows = math.max(1, round(vu_range * rows))
+    -- Näytä VU jos on mitään signaalia (hyvin matala kynnys)
+    -- Jos vu_amp on > 0, näytä vähintään yksi rivi
+    if vu_amp > 0.00001 then
+      -- Käytä koko amplitudin vaihteluväliä (0..1) suoraan rivimäärään
+      -- Varmista että vähintään yksi rivi näkyy jos on signaalia
+      lit_rows = math.max(1, math.min(rows, round(vu_amp * rows)))
     end
     
     -- Aina näkyvä: joko VU-taso tai yksi himmeä rivi alhaalla (yhteys-indikaattori)
@@ -1164,10 +1185,19 @@ local function analyzer_loop()
     state.amp_norm = math.max(amp, state.amp_pulse)
     state.pitch_midi = current_pitch_midi()
     
-    -- VU: käytä samaa signaalia kuin amp_raw (sample = ulostulo, line-in = sisääntulo), decay hitaampi
-    -- Käytä sekä normalisoitua että raakaa signaalia paremman responsiivisuuden vuoksi
-    local instant = math.max(state.amp_norm or 0, math.min(1, amp_raw * 3))
-    state.vu_level = math.max(instant, (state.vu_level or 0) * 0.995)
+    -- VU: käytä suoraan raakaa signaalia ilman normalisointia, vahvistus jotta palkki liikkuu
+    -- Sample-tilassa käytä ulostuloa, line-in-tilassa sisääntuloa
+    local vu_raw = 0
+    if sample_mode then
+      vu_raw = math.max(state.amp_out_l or 0, state.amp_out_r or 0)
+    else
+      vu_raw = math.max(state.amp_in_l or 0, state.amp_in_r or 0)
+    end
+    
+    -- Vahvista signaali ja käytä decay-logiikkaa
+    local vu_scaled = math.min(1, vu_raw * 15)  -- Vahva vahvistus
+    local instant = math.max(vu_scaled, state.amp_norm or 0)
+    state.vu_level = math.max(instant, (state.vu_level or 0) * 0.99)  -- Hitaampi decay
 
     -- Sample-mode trigger from transients, not fixed clock.
     local threshold = params:get("threshold")
