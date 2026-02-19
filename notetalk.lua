@@ -1495,6 +1495,7 @@ end
 function cleanup()
   -- Ultra-safe shutdown: cancel local callbacks/timers only, avoid backend audio calls during global restart.
   state.freeze = true
+  
   -- Peruuta vain kelvolliset clock-id:t (väärä tyyppi aiheuttaa clock.resume -virheen)
   for _, id in ipairs(deferred_clocks) do
     if type(id) == "number" and id then
@@ -1502,16 +1503,29 @@ function cleanup()
     end
   end
   deferred_clocks = {}
+  
   cleanup_polls()
-  if midi_out then midi_out:cleanup() end
+  
+  if midi_out then
+    pcall(function() midi_out:cleanup() end)
+  end
+  
+  -- Turvallinen metro-pysäytys
   if grid_redraw_metro then
-    grid_redraw_metro:stop()
+    pcall(function() grid_redraw_metro:stop() end)
     grid_redraw_metro = nil
   end
+  if pitch_retry_metro then
+    pcall(function() pitch_retry_metro:stop() end)
+    pitch_retry_metro = nil
+  end
+  
+  -- Grid cleanup
   if g then
     pcall(function() g:all(0); g:refresh() end)
     g = nil
   end
+  
   -- ENGINE CLEANUP - yksinkertainen
   pcall(function() engine.amp(0) end)
   pcall(function() engine.level(0) end)
